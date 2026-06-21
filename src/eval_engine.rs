@@ -12,7 +12,7 @@ use crate::game::{Color, Game, Move, Piece, PieceTy, Pos};
 
 const CHECKMATE: i64 = i64::MAX;
 
-const MAX_TIME: std::time::Duration = std::time::Duration::from_millis(5000);
+const MAX_TIME: std::time::Duration = std::time::Duration::from_millis(2000);
 
 const BASE_MOVE: Move = ((8, 8), (8, 8));
 
@@ -37,6 +37,14 @@ impl Engine {
 
         self.start_time = std::time::Instant::now();
         loop {
+            /*
+            eprintln!(
+                "depth {} at {}ms",
+                depth,
+                self.start_time.elapsed().as_millis()
+            );
+            */
+
             if best.0 == CHECKMATE || self.timed_out() {
                 break (best.0, best.1, depth);
             }
@@ -156,7 +164,7 @@ impl Engine {
         }
 
         const PIECE_MULT: i64 = 3;
-        const PIECE_POS_MULT: i64 = 1;
+        const PIECE_POS_MULT: i64 = 2;
 
         let basic_piece_score =
             Self::get_total_piece_score(game) * color.to_int() as i64 * PIECE_MULT;

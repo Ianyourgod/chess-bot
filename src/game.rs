@@ -1,9 +1,6 @@
 use rand::{prelude::*, rngs::SmallRng};
 use rayon::{iter::ParallelIterator, prelude::*};
-use std::{
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
-};
+use std::{collections::HashMap, sync::LazyLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Piece {
@@ -69,12 +66,47 @@ impl Color {
             Self::Black => Self::White,
         }
     }
+
+    pub fn start(self) -> usize {
+        match self {
+            Self::White => 0,
+            Self::Black => 7,
+        }
+    }
 }
 
 pub type Pos = (usize, usize);
 pub type Move = (Pos, Pos);
 
 type Board = [[Option<Piece>; 8]; 8];
+
+static ZOBRIST_TABLE: LazyLock<[[[u64; 12]; 8]; 8]> = LazyLock::new(|| {
+    let mut rng = SmallRng::from_seed(*b"andrewrobsonlovespenis1234567890");
+    let mut z = [[[0u64; 12]; 8]; 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            for p in 0..12 {
+                z[y][x][p] = rng.next_u64();
+            }
+        }
+    }
+    z
+});
+static ZOBRIST_SIDE_TO_MOVE: LazyLock<u64> =
+    LazyLock::new(|| SmallRng::from_seed(*b"sideblck00000000000000000000000a").next_u64());
+
+static ZOBRIST_CASTLING: LazyLock<[[u64; 2]; 2]> = LazyLock::new(|| {
+    let mut rng = SmallRng::from_seed(*b"castling00000000000000000000000b");
+    [
+        [rng.next_u64(), rng.next_u64()],
+        [rng.next_u64(), rng.next_u64()],
+    ]
+});
+
+static ZOBRIST_ENPASS: LazyLock<[u64; 8]> = LazyLock::new(|| {
+    let mut rng = SmallRng::from_seed(*b"enpassnt00000000000000000000000c");
+    std::array::from_fn(|_| rng.next_u64())
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Game {
@@ -85,57 +117,54 @@ pub struct Game {
     full_move_clock: u32,
 
     previous_positions: HashMap<u64, usize>, // hash -> number of times
-    zobrist_table: [[[u64; 12]; 8]; 8],
-}
-
-impl Hash for Game {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let mut z_hash = 0;
-        for (y, row) in self.board.iter().enumerate() {
-            for (x, piece) in row.iter().enumerate() {
-                if let Some(piece) = piece {
-                    z_hash ^= self.zobrist_table[y][x][piece.to_int()];
-                }
-            }
-        }
-
-        z_hash.hash(state);
-        self.castleable.hash(state);
-        self.enpass.hash(state);
-        self.full_move_clock.hash(state);
-        self.to_move.hash(state);
-    }
+    hash: u64,
 }
 
 impl Game {
     pub fn new(board: Board, to_move: Color) -> Self {
+        let castleable = [(true, true); 2];
+        let enpass = None;
+        let hash = Self::gen_full_hash(&board, to_move, castleable, enpass);
         Self {
             board,
-            castleable: [(true, true); 2],
-            enpass: None,
+            castleable,
+            enpass,
             to_move,
             previous_positions: HashMap::new(),
             full_move_clock: 0,
-            zobrist_table: Self::gen_zobrist_table(),
+            hash,
         }
     }
 
-    fn gen_zobrist_table() -> [[[u64; 12]; 8]; 8] {
-        const ZOBRIST_SEED: [u8; 32] = [
-            150, 77, 57, 107, 45, 235, 181, 109, 28, 241, 146, 156, 218, 138, 213, 40, 216, 39,
-            196, 149, 150, 119, 232, 178, 175, 106, 25, 225, 48, 187, 117, 162,
-        ];
-        let mut rng = SmallRng::from_seed(ZOBRIST_SEED);
-
-        let mut z = [[[0; 12]; 8]; 8];
-        for y in 0..8 {
-            for x in 0..8 {
-                for p in 0..12 {
-                    z[y][x][p] = rng.next_u64();
+    fn gen_full_hash(
+        board: &Board,
+        to_move: Color,
+        castleable: [(bool, bool); 2],
+        enpass: Option<Pos>,
+    ) -> u64 {
+        let mut h = 0u64;
+        for (y, row) in board.iter().enumerate() {
+            for (x, piece) in row.iter().enumerate() {
+                if let Some(p) = piece {
+                    h ^= ZOBRIST_TABLE[y][x][p.to_int()];
                 }
             }
         }
-        z
+        if to_move == Color::Black {
+            h ^= *ZOBRIST_SIDE_TO_MOVE;
+        }
+        for color in 0..2 {
+            if castleable[color].0 {
+                h ^= ZOBRIST_CASTLING[color][0];
+            }
+            if castleable[color].1 {
+                h ^= ZOBRIST_CASTLING[color][1];
+            }
+        }
+        if let Some((file, _)) = enpass {
+            h ^= ZOBRIST_ENPASS[file];
+        }
+        h
     }
 
     #[allow(unused)]
@@ -228,24 +257,17 @@ impl Game {
             enpass,
             previous_positions: HashMap::new(),
             full_move_clock: 0,
-            zobrist_table: Self::gen_zobrist_table(),
+            hash: Self::gen_full_hash(&board, to_move, castleable, enpass),
         }
     }
 
     pub fn get_hash(&self) -> u64 {
-        let mut s = DefaultHasher::new();
-        self.hash(&mut s);
-        s.finish()
+        self.hash
     }
 
     #[inline]
     pub fn get_to_move(&self) -> Color {
         self.to_move
-    }
-
-    #[inline]
-    pub fn swap_to_move(&mut self) {
-        self.to_move = self.to_move.other();
     }
 
     #[inline]
@@ -277,22 +299,58 @@ impl Game {
         *self.previous_positions.entry(self.get_hash()).or_insert(0) += 1;
 
         let moving = self.board[m.0.1][m.0.0].unwrap();
+        let moving_color_index = moving.color.to_index();
+
+        self.hash ^= ZOBRIST_TABLE[m.0.1][m.0.0][moving.to_int()];
+
         if moving.ty == PieceTy::Pawn && Some(m.1) == self.enpass {
+            self.hash ^= ZOBRIST_TABLE[m.0.1][m.1.0][self.board[m.0.1][m.1.0].unwrap().to_int()];
             self.board[m.0.1][m.1.0] = None; // y of start, x of end
+        }
+        if let Some(e) = self.enpass {
+            self.hash ^= ZOBRIST_ENPASS[e.0];
         }
         self.enpass = None;
         if moving.ty == PieceTy::Pawn && (m.0.1.abs_diff(m.1.1) == 2) {
             let mid_y = (m.0.1 + m.1.1) / 2;
-            self.enpass = Some((m.1.1, mid_y));
+            self.enpass = Some((m.1.0, mid_y));
+            self.hash ^= ZOBRIST_ENPASS[m.1.0];
         }
+
+        let cas = [
+            (self.castleable[moving_color_index], moving_color_index),
+            (
+                self.castleable[moving.color.other().to_index()],
+                moving.color.other().to_index(),
+            ),
+        ];
         if moving.ty == PieceTy::King {
-            self.castleable[moving.color.to_index()] = (false, false);
+            self.castleable[moving_color_index] = (false, false);
         }
-        if moving.ty == PieceTy::Rook && m.0.1 == moving.color.to_index() * 7 {
+        if moving.ty == PieceTy::Rook && m.0.1 == moving_color_index * 7 {
             if m.0.0 == 0 {
-                self.castleable[moving.color.to_index()].0 = false;
+                self.castleable[moving_color_index].0 = false;
             } else if m.0.0 == 7 {
-                self.castleable[moving.color.to_index()].1 = false;
+                self.castleable[moving_color_index].1 = false;
+            }
+        }
+        if let Some(rook) = self.get(m.1)
+            && m.1.1 == rook.color.start()
+            && rook.ty == PieceTy::Rook
+        {
+            if m.1.0 == 0 {
+                self.castleable[moving.color.other().to_index()].0 = false;
+            } else if m.1.0 == 7 {
+                self.castleable[moving.color.other().to_index()].1 = false;
+            }
+        }
+
+        for (cas, idx) in cas {
+            if self.castleable[idx].0 != cas.0 {
+                self.hash ^= ZOBRIST_CASTLING[idx][0];
+            }
+            if self.castleable[idx].1 != cas.1 {
+                self.hash ^= ZOBRIST_CASTLING[idx][1];
             }
         }
 
@@ -300,12 +358,25 @@ impl Game {
             // castling
             // we move the rook too
             let (rook_x, rook_final) = if m.0.0 > m.1.0 { (0, 3) } else { (7, 5) };
+            let rook = self.board[m.0.1][rook_x].unwrap();
             self.board[m.0.1][rook_final] = self.board[m.0.1][rook_x];
-            self.board[m.0.1][rook_x] = None
+            self.board[m.0.1][rook_x] = None;
+            self.hash ^= ZOBRIST_TABLE[m.0.1][rook_final][rook.to_int()];
+            self.hash ^= ZOBRIST_TABLE[m.0.1][rook_x][rook.to_int()];
+        }
+
+        if let Some(captured) = self.board[m.1.1][m.1.0] {
+            self.hash ^= ZOBRIST_TABLE[m.1.1][m.1.0][captured.to_int()];
         }
 
         self.board[m.1.1][m.1.0] = self.board[m.0.1][m.0.0];
         self.board[m.0.1][m.0.0] = None;
+
+        self.hash ^= ZOBRIST_TABLE[m.1.1][m.1.0][moving.to_int()];
+
+        self.hash ^= *ZOBRIST_SIDE_TO_MOVE;
+
+        self.to_move = self.to_move.other();
     }
 
     #[inline]
@@ -334,20 +405,21 @@ impl Game {
 
         match piece.ty {
             PieceTy::Bishop => {
-                let x_change = start.0 as isize - end.0 as isize;
-                let y_change = start.1 as isize - end.1 as isize;
+                let x_change = end.0 as isize - start.0 as isize;
+                let y_change = end.1 as isize - start.1 as isize;
 
-                if x_change != y_change {
+                if x_change.abs() != y_change.abs() {
                     return false;
                 }
 
                 // one less as we don't care whether the target is occupied
                 for delta in 1..(x_change.abs()) {
-                    let delta = delta * x_change.signum();
+                    let dx = delta * x_change.signum();
+                    let dy = delta * y_change.signum();
 
                     let pos = (
-                        (start.0 as isize + delta) as usize,
-                        (start.1 as isize + delta) as usize,
+                        (start.0 as isize + dx) as usize,
+                        (start.1 as isize + dy) as usize,
                     );
 
                     if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
@@ -391,14 +463,16 @@ impl Game {
                     return false;
                 }
 
-                let man_dist = start.1.abs_diff(end.1) + start.0.abs_diff(end.0);
+                let man_dist = (start.1.abs_diff(end.1) + start.0.abs_diff(end.0)) as isize;
+                let neg = start.1 > end.1 || start.0 > end.0;
 
                 // one less as we don't care whether the target is occupied
                 for delta in 1..man_dist {
+                    let delta = if neg { -delta } else { delta };
                     let pos = if vertical {
-                        (start.0, start.1 + delta)
+                        (start.0, (start.1 as isize + delta) as usize)
                     } else {
-                        (start.0 + delta, start.1)
+                        ((start.0 as isize + delta) as usize, start.1)
                     };
 
                     if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
@@ -460,14 +534,16 @@ impl Game {
                         return false;
                     }
 
-                    let man_dist = start.1.abs_diff(end.1) + start.0.abs_diff(end.0);
+                    let man_dist = (start.1.abs_diff(end.1) + start.0.abs_diff(end.0)) as isize;
+                    let neg = start.1 > end.1 || start.0 > end.0;
 
                     // one less as we don't care whether the target is occupied
                     for delta in 1..man_dist {
+                        let delta = if neg { -delta } else { delta };
                         let pos = if vertical {
-                            (start.0, start.1 + delta)
+                            (start.0, (start.1 as isize + delta) as usize)
                         } else {
-                            (start.0 + delta, start.1)
+                            ((start.0 as isize + delta) as usize, start.1)
                         };
 
                         if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
@@ -476,10 +552,10 @@ impl Game {
                     }
                 } else {
                     // bishop-like movement
-                    let x_change = start.0 as isize - end.0 as isize;
-                    let y_change = start.1 as isize - end.1 as isize;
+                    let x_change = end.0 as isize - start.0 as isize;
+                    let y_change = end.1 as isize - start.1 as isize;
 
-                    if x_change != y_change {
+                    if x_change.abs() != y_change.abs() {
                         return false;
                     }
 
@@ -606,7 +682,7 @@ impl Game {
 
         // pawn
         {
-            let y_dir = other.to_int();
+            let y_dir = other.other().to_int();
             let y = pos.1 as isize + y_dir;
             if y >= 0 && y <= 7 {
                 let check = |x: isize| {
@@ -617,9 +693,32 @@ impl Game {
                             .is_some_and(|p| p == Piece::new(PieceTy::Pawn, other))
                 };
 
-                if check(pos.0 as isize + 1) || check(pos.1 as isize - 1) {
+                if check(pos.0 as isize + 1) || check(pos.0 as isize - 1) {
                     return true;
                 }
+            }
+        }
+
+        for delta in [
+            (1, 1),
+            (1, 0),
+            (1, -1),
+            (0, -1),
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, 1),
+        ] {
+            let p = (pos.0 as isize + delta.0, pos.1 as isize + delta.1);
+            if p.0 < 0 || p.0 > 7 || p.1 < 0 || p.1 > 7 {
+                continue;
+            }
+            let p = (p.0 as usize, p.1 as usize);
+            if self
+                .get(p)
+                .is_some_and(|piece| piece.color == other && piece.ty == PieceTy::King)
+            {
+                return true;
             }
         }
 
@@ -677,7 +776,7 @@ impl Game {
                             (pos.0, y),
                             (pos.0, y + pawn_move_dir), // move 2 tiles
                             (pos.0 - 1, y),
-                            (pos.1 + 1, y),
+                            (pos.0 + 1, y),
                         ]
                     }
                     PieceTy::King => {
