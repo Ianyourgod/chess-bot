@@ -46,7 +46,7 @@ pub enum Color {
 }
 
 impl Color {
-    pub fn to_int(self) -> isize {
+    pub fn to_int(self) -> i64 {
         match self {
             Self::White => 1,
             Self::Black => -1,
@@ -223,9 +223,13 @@ impl Game {
         let castleable = if let Some(c) = castling
             && c != "-"
         {
-            [(true, true); 2]
+            let wq = c.contains('Q');
+            let wk = c.contains('K');
+            let bq = c.contains('q');
+            let bk = c.contains('k');
+            [(wq, wk), (bq, bk)]
         } else {
-            [(true, true); 2]
+            [(false, false); 2]
         };
 
         let enpass = if let Some(e) = enpass
@@ -428,7 +432,7 @@ impl Game {
                 }
             }
             PieceTy::Pawn => {
-                let move_dir = piece.color.to_int();
+                let move_dir = piece.color.to_int() as isize;
 
                 let occupied = self.occupied(end);
 
@@ -446,13 +450,24 @@ impl Game {
                     }
                 }
 
+                let en_pass = !occupied
+                    && Some(end) == self.enpass
+                    && self
+                        .get((end.0, start.1))
+                        .is_some_and(|p| p.color == piece.color.other());
+
                 let x_dist = start.0.abs_diff(end.0);
-                if x_dist == 0 && occupied {
-                    return false;
-                } else if x_dist > 1 {
-                    return false;
-                } else if x_dist == 1 && !occupied && Some(end) != self.enpass {
-                    return false;
+                if x_dist == 0 {
+                    if occupied {
+                        return false; // blocked
+                    }
+                    // straight push — valid, fall through
+                } else if x_dist == 1 {
+                    if !en_pass && !occupied {
+                        return false; // diagonal must be a capture
+                    }
+                } else {
+                    return false; // can't move sideways more than 1
                 }
             }
             PieceTy::Rook => {
@@ -683,7 +698,7 @@ impl Game {
         // pawn
         {
             let y_dir = other.other().to_int();
-            let y = pos.1 as isize + y_dir;
+            let y = pos.1 as i64 + y_dir;
             if y >= 0 && y <= 7 {
                 let check = |x: isize| {
                     x >= 0
@@ -769,7 +784,7 @@ impl Game {
             .flat_map(move |(pos, piece)| {
                 match piece.ty {
                     PieceTy::Pawn => {
-                        let pawn_move_dir = c.to_int();
+                        let pawn_move_dir = c.to_int() as isize;
                         let y = pos.1 + pawn_move_dir;
 
                         vec![

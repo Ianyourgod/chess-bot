@@ -3,7 +3,7 @@ mod eval_engine;
 mod game;
 
 fn main() {
-    flame_on();
+    player_vs_bot();
 }
 
 #[allow(unused)]
@@ -35,7 +35,7 @@ fn flame_on() {
     let turns = 10;
     for _ in 0..turns {
         if !game.checkmate(game.get_to_move()) {
-            let engine_move = engine.best_move(&game, game.get_to_move());
+            let engine_move = engine.best_move(&game);
             game.move_piece(engine_move.1);
         }
     }

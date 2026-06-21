@@ -67,7 +67,7 @@ impl App {
             if !self.board.checkmate(self.board.get_to_move())
                 && !self.board.stalemate(self.board.get_to_move())
             {
-                let engine_move = self.engine.best_move(&self.board, self.board.get_to_move());
+                let engine_move = self.engine.best_move(&self.board);
                 self.board.move_piece(engine_move.1);
                 depth = engine_move.2;
             }
@@ -90,6 +90,9 @@ impl App {
         let mut depth = 0;
         let mut cursor_pos = (0, 0);
         let mut selected = None;
+
+        let bot_color = Color::White;
+
         loop {
             let render =
                 |frame: &mut Frame| self.render(frame, depth, Some((cursor_pos, selected)));
@@ -97,9 +100,9 @@ impl App {
 
             if !self.board.checkmate(self.board.get_to_move())
                 && !self.board.stalemate(self.board.get_to_move())
-                && self.board.get_to_move() == Color::Black
+                && self.board.get_to_move() == bot_color
             {
-                let engine_move = self.engine.best_move(&self.board, Color::Black);
+                let engine_move = self.engine.best_move(&self.board);
                 self.board.move_piece(engine_move.1);
                 depth = engine_move.2;
             }
@@ -123,7 +126,7 @@ impl App {
                         KeyCode::Esc | KeyCode::Char('q') => break Ok(()),
                         _ if self.board.checkmate(self.board.get_to_move())
                             || self.board.stalemate(self.board.get_to_move())
-                            || self.board.get_to_move() != Color::White =>
+                            || self.board.get_to_move() == bot_color =>
                         {
                             ()
                         }
