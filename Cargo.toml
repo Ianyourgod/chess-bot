@@ -7,4 +7,6 @@ edition = "2024"
 dashmap = "6.2.1"
 rand = "0.10.1"
 ratatui = "0.30.1"
-rayon = "1.12.0"
+
+[profile.release]
+debug = true

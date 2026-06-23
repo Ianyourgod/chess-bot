@@ -1,19 +1,11 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use rayon::prelude::*;
-
-use std::sync::{
-    Mutex,
-    atomic::{AtomicI64, Ordering},
-};
 
 use crate::game::{Color, Game, Move, Piece, PieceTy, Pos};
 
 const CHECKMATE: i64 = i64::MAX;
 const DRAW: i64 = -200;
-
-const MAX_TIME: std::time::Duration = std::time::Duration::from_millis(10000);
 
 const BASE_MOVE: Move = ((8, 8), (8, 8));
 
@@ -33,13 +25,15 @@ enum CacheBound {
 pub struct Engine {
     cache: DashMap<u64, (i64, Move, u32, CacheBound)>,
     start_time: Instant,
+    max_time: Duration,
 }
 
 impl Engine {
-    pub fn new() -> Self {
+    pub fn new(max_time: Duration) -> Self {
         Self {
             cache: DashMap::new(),
             start_time: Instant::now(),
+            max_time,
         }
     }
 
@@ -79,7 +73,7 @@ impl Engine {
     }
 
     fn timed_out(&self) -> bool {
-        self.start_time.elapsed() >= MAX_TIME
+        self.start_time.elapsed() >= self.max_time
     }
 
     fn eval_rec(
@@ -126,86 +120,40 @@ impl Engine {
             return (self.quiescence(game, alpha, beta, moves), BASE_MOVE);
         }
 
-        let parallelize = moves <= 3;
-
         let original_alpha = alpha;
 
-        let best = if parallelize {
-            let alpha = AtomicI64::new(alpha);
-            let best = Mutex::new(Option::<(i64, Move)>::None);
-            if let Some(r) = game.get_all_moves(game.get_to_move()).find_map_any(|m| {
-                let score = -self
-                    .eval_rec(
-                        &game.clone().move_change(m),
-                        depth - 1,
-                        -beta,
-                        -alpha.load(Ordering::Relaxed),
-                        moves + 1,
-                    )
-                    .0;
+        let mut best: Option<(i64, Move)> = None;
+        let p_moves = game.get_all_moves(game.get_to_move()).collect::<Vec<_>>();
 
-                if self.timed_out() {
-                    return Some((0, BASE_MOVE));
-                }
+        let mut scored: Vec<_> = p_moves
+            .into_iter()
+            .map(|m| {
+                let g = game.clone().move_change(m);
+                (-self.eval_base(&g, moves), (m, g))
+            })
+            .collect();
 
-                if score >= beta {
-                    return Some((beta, m));
-                }
+        scored.sort_by(|(a, _), (b, _)| b.cmp(a));
 
-                alpha.fetch_max(score, Ordering::Relaxed);
+        for (m, g) in scored.into_iter().map(|(_, m)| m) {
+            let score = -self.eval_rec(&g, depth - 1, -beta, -alpha, moves + 1).0;
 
-                let mut b = best.lock().unwrap();
-                *b = Some(match *b {
-                    Some(prev) if prev.0 >= score => prev,
-                    _ => (score, m),
-                });
-
-                None
-            }) {
-                return r;
+            if self.timed_out() {
+                return (0, BASE_MOVE);
             }
-            best.into_inner().unwrap()
-        } else {
-            let mut best: Option<(i64, Move)> = None;
-            let p_moves = game.get_all_moves(game.get_to_move()).collect::<Vec<_>>();
 
-            let mut scored: Vec<(i64, Move)> = p_moves
-                .into_iter()
-                .map(|m| (-self.eval_base(&game.clone().move_change(m), moves), m))
-                .collect();
-
-            scored.sort_by(|(a, _), (b, _)| b.cmp(a));
-
-            let p_moves: Vec<Move> = scored.into_iter().map(|(_, m)| m).collect();
-            for m in p_moves {
-                let score = -self
-                    .eval_rec(
-                        &game.clone().move_change(m),
-                        depth - 1,
-                        -beta,
-                        -alpha,
-                        moves + 1,
-                    )
-                    .0;
-
-                if self.timed_out() {
-                    return (0, BASE_MOVE);
-                }
-
-                if score >= beta {
-                    return (beta, m);
-                }
-
-                alpha = alpha.max(score);
-
-                best = Some(match best {
-                    Some(prev) if prev.0 >= score => prev,
-                    _ => (score, m),
-                });
+            if score >= beta {
+                return (beta, m);
             }
-            best
+
+            alpha = alpha.max(score);
+
+            best = Some(match best {
+                Some(prev) if prev.0 >= score => prev,
+                _ => (score, m),
+            });
         }
-        .unwrap(); // cannot be none - not checkmate or stalemate
+        let best = best.unwrap(); // cannot be none - not checkmate or stalemate
 
         self.cache.insert(
             game.get_hash(),
@@ -287,30 +235,20 @@ impl Engine {
         }
         alpha = alpha.max(stand_pat);
 
-        let alpha = AtomicI64::new(alpha);
-
-        if let Some(s) = game
+        for m in game
             .get_all_moves(game.get_to_move())
             .filter(|&m| game.is_capture(m))
-            .find_map_any(|m| {
-                let score = -self.quiescence(
-                    &game.clone().move_change(m),
-                    -beta,
-                    -alpha.load(Ordering::Relaxed),
-                    moves + 1,
-                );
-                if score >= beta {
-                    return Some(beta);
-                }
-                alpha.fetch_max(score, Ordering::Relaxed);
-
-                None
-            })
         {
-            return s;
+            let score = -self.quiescence(&game.clone().move_change(m), -beta, -alpha, moves + 1);
+            if score >= beta {
+                return beta;
+            }
+            if score > alpha {
+                alpha = score;
+            };
         }
 
-        alpha.into_inner()
+        alpha
     }
 
     /// white is positive

@@ -25,9 +25,9 @@ pub fn bot_on_bot(game: Game) {
     ratatui::run(run).unwrap();
 }
 
-pub fn player_vs_bot(game: Game) {
+pub fn player_vs_bot(game: Game, bot_color: Color) {
     let mut app = App::new(game);
-    let run = |t: &mut DefaultTerminal| app.player_bot(t);
+    let run = |t: &mut DefaultTerminal| app.player_bot(t, bot_color);
     ratatui::run(run).unwrap();
 }
 
@@ -40,7 +40,7 @@ impl App {
     pub fn new(board: Game) -> Self {
         Self {
             board,
-            engine: Engine::new(),
+            engine: Engine::new(std::time::Duration::from_millis(5000)),
         }
     }
 
@@ -86,12 +86,14 @@ impl App {
         }
     }
 
-    fn player_bot(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    fn player_bot(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        bot_color: Color,
+    ) -> std::io::Result<()> {
         let mut depth = 0;
         let mut cursor_pos = (0, 0);
         let mut selected = None;
-
-        let bot_color = Color::White;
 
         loop {
             let render =

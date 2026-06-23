@@ -1,6 +1,5 @@
 use rand::{prelude::*, rngs::SmallRng};
-use rayon::{iter::ParallelIterator, prelude::*};
-use std::{collections::HashMap, sync::LazyLock};
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Piece {
@@ -108,29 +107,35 @@ static ZOBRIST_ENPASS: LazyLock<[u64; 8]> = LazyLock::new(|| {
     std::array::from_fn(|_| rng.next_u64())
 });
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Game {
     board: Board,
     to_move: Color,
     castleable: [(bool, bool); 2],
     enpass: Option<Pos>,
-    full_move_clock: u32,
+    #[allow(unused)]
+    full_move_clock: u32, // TODO: implement
 
-    previous_positions: HashMap<u64, usize>, // hash -> number of times
+    previous_positions: [u64; 256],
+    prev_pos_idx: usize,
     hash: u64,
 }
 
 impl Game {
-    pub fn new(board: Board, to_move: Color) -> Self {
-        let castleable = [(true, true); 2];
-        let enpass = None;
+    pub fn new(
+        board: Board,
+        castleable: [(bool, bool); 2],
+        enpass: Option<Pos>,
+        to_move: Color,
+    ) -> Self {
         let hash = Self::gen_full_hash(&board, to_move, castleable, enpass);
         Self {
             board,
             castleable,
             enpass,
             to_move,
-            previous_positions: HashMap::new(),
+            previous_positions: [0; 256],
+            prev_pos_idx: 0,
             full_move_clock: 0,
             hash,
         }
@@ -254,15 +259,8 @@ impl Game {
             None
         };
 
-        Self {
-            board,
-            to_move,
-            castleable,
-            enpass,
-            previous_positions: HashMap::new(),
-            full_move_clock: 0,
-            hash: Self::gen_full_hash(&board, to_move, castleable, enpass),
-        }
+        // TODO: use new
+        Self::new(board, castleable, enpass, to_move)
     }
 
     pub fn get_hash(&self) -> u64 {
@@ -276,13 +274,16 @@ impl Game {
 
     #[inline]
     pub fn has_been_played(&self, g: &Game) -> bool {
-        self.previous_positions.contains_key(&g.get_hash())
+        self.previous_positions.contains(&g.get_hash())
     }
 
     pub fn lose_on_repeat(&self) -> bool {
         self.previous_positions
-            .get(&self.get_hash())
-            .is_some_and(|n| *n >= 2)
+            .iter()
+            .take_while(|&&n| n != 0)
+            .filter(|&&n| n == self.get_hash())
+            .count()
+            >= 2
     }
 
     #[inline]
@@ -300,7 +301,8 @@ impl Game {
             return;
         }
 
-        *self.previous_positions.entry(self.get_hash()).or_insert(0) += 1;
+        self.previous_positions[self.prev_pos_idx] = self.get_hash();
+        self.prev_pos_idx += 1;
 
         let moving = self.board[m.0.1][m.0.0].unwrap();
         let moving_color_index = moving.color.to_index();
@@ -594,11 +596,7 @@ impl Game {
 
         let move_made = self.clone().move_change(m);
 
-        if self
-            .previous_positions
-            .get(&move_made.get_hash())
-            .is_some_and(|n| *n >= 2)
-        {
+        if move_made.lose_on_repeat() {
             return false;
         }
 
@@ -628,24 +626,28 @@ impl Game {
     pub fn under_threat_pos(&self, pos: Pos, by: Color) -> bool {
         let other = by;
 
-        for x in (-2_isize..=-1).chain(1..=2) {
-            for y in (-2_isize..=-1).chain(1..=2) {
-                if !((x.abs() == 2) ^ (y.abs() == 2)) || !((x.abs() == 1) ^ (y.abs() == 1)) {
-                    continue;
-                }
-                let oob = |a: isize, x: isize| a + x < 0 || a + x >= 8;
-                if oob(pos.0 as isize, x) || oob(pos.1 as isize, y) {
-                    continue;
-                }
+        const KNIGHT_DELTAS: [(isize, isize); 8] = [
+            (2, 1),
+            (2, -1),
+            (-2, 1),
+            (-2, -1),
+            (1, 2),
+            (1, -2),
+            (-1, 2),
+            (-1, -2),
+        ];
 
-                let pos = ((pos.0 as isize + x) as usize, (pos.1 as isize + y) as usize);
-
-                if self
-                    .get(pos)
-                    .is_some_and(|p| p.ty == PieceTy::Knight && p.color == other)
-                {
-                    return true;
-                }
+        for (dx, dy) in KNIGHT_DELTAS {
+            let nx = pos.0 as isize + dx;
+            let ny = pos.1 as isize + dy;
+            if nx < 0 || nx >= 8 || ny < 0 || ny >= 8 {
+                continue;
+            }
+            if self
+                .get((nx as usize, ny as usize))
+                .is_some_and(|p| p.ty == PieceTy::Knight && p.color == other)
+            {
+                return true;
             }
         }
 
@@ -749,11 +751,11 @@ impl Game {
     }
 
     pub fn checkmate(&self, c: Color) -> bool {
-        self.check(c) && self.get_all_moves(c).find_any(|_| true).is_none()
+        self.check(c) && self.get_all_moves(c).find(|_| true).is_none()
     }
 
     pub fn stalemate(&self, c: Color) -> bool {
-        !self.check(c) && self.get_all_moves(c).find_any(|_| true).is_none()
+        !self.check(c) && self.get_all_moves(c).find(|_| true).is_none()
     }
 
     #[inline]
@@ -773,11 +775,11 @@ impl Game {
         false
     }
 
-    pub fn get_all_moves(&self, c: Color) -> impl ParallelIterator<Item = Move> {
+    pub fn get_all_moves(&self, c: Color) -> impl Iterator<Item = Move> {
         self.board
-            .par_iter()
+            .iter()
             .enumerate()
-            .flat_map(|(y, row)| row.par_iter().enumerate().map(move |(x, p)| ((x, y), p)))
+            .flat_map(|(y, row)| row.iter().enumerate().map(move |(x, p)| ((x, y), p)))
             .filter_map(|(pos, p)| p.map(|p| (pos, p)))
             .filter(move |(_, p)| p.color == c)
             .map(|(pos, piece)| ((pos.0 as isize, pos.1 as isize), piece))
@@ -873,54 +875,6 @@ impl Game {
 
 impl Default for Game {
     fn default() -> Self {
-        let white_pawn = Piece::new(PieceTy::Pawn, Color::White);
-        let white_front = [Some(white_pawn); 8];
-
-        let white_rook = Piece::new(PieceTy::Rook, Color::White);
-        let white_knight = Piece::new(PieceTy::Knight, Color::White);
-        let white_bishop = Piece::new(PieceTy::Bishop, Color::White);
-        let white_back = [
-            Some(white_rook),
-            Some(white_knight),
-            Some(white_bishop),
-            Some(Piece::new(PieceTy::Queen, Color::White)),
-            Some(Piece::new(PieceTy::King, Color::White)),
-            Some(white_bishop),
-            Some(white_knight),
-            Some(white_rook),
-        ];
-
-        let middle = [None; 8];
-
-        let black_pawn = Piece::new(PieceTy::Pawn, Color::Black);
-        let black_front = [Some(black_pawn); 8];
-
-        let black_rook = Piece::new(PieceTy::Rook, Color::Black);
-        let black_knight = Piece::new(PieceTy::Knight, Color::Black);
-        let black_bishop = Piece::new(PieceTy::Bishop, Color::Black);
-        let black_back = [
-            Some(black_rook),
-            Some(black_knight),
-            Some(black_bishop),
-            Some(Piece::new(PieceTy::Queen, Color::Black)),
-            Some(Piece::new(PieceTy::King, Color::Black)),
-            Some(black_bishop),
-            Some(black_knight),
-            Some(black_rook),
-        ];
-
-        Self::new(
-            [
-                white_back,
-                white_front,
-                middle,
-                middle,
-                middle,
-                middle,
-                black_front,
-                black_back,
-            ],
-            Color::White,
-        )
+        Self::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
     }
 }

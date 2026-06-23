@@ -3,7 +3,25 @@ mod eval_engine;
 mod game;
 
 fn main() {
-    player_vs_bot();
+    let mut args = std::env::args().skip(1);
+    let p = args.next();
+
+    let Some(p) = p else {
+        player_vs_bot();
+        return;
+    };
+
+    match p.as_str() {
+        "flame" => flame_on(
+            args.next().map(|n| n.parse::<u32>().unwrap()).unwrap_or(8),
+            args.next()
+                .map(|n| n.parse::<u64>().unwrap())
+                .unwrap_or(3000),
+        ),
+        "bot" => bot_on_bot(),
+        "otherbot" => otherbot(),
+        c => panic!("unknown arg \"{c}\""),
+    }
 }
 
 #[allow(unused)]
@@ -24,15 +42,24 @@ fn bot_on_bot() {
 fn player_vs_bot() {
     let game = game::Game::default();
 
-    display::player_vs_bot(game);
+    display::player_vs_bot(game, game::Color::Black);
 }
 
 #[allow(unused)]
-fn flame_on() {
+fn otherbot() {
     let mut game = game::Game::default();
-    let mut engine = eval_engine::Engine::new();
 
-    let turns = 10;
+    display::player_vs_bot(game, game::Color::White);
+}
+
+#[allow(unused)]
+fn flame_on(moves: u32, time_ms: u64) {
+    let wait_time = std::time::Duration::from_millis(time_ms);
+
+    let mut game = game::Game::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq c3");
+    let mut engine = eval_engine::Engine::new(wait_time);
+
+    let turns = moves;
     for _ in 0..turns {
         if !game.checkmate(game.get_to_move()) {
             let engine_move = engine.best_move(&game);
