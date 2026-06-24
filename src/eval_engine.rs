@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-use crate::game::{Color, Game, Move, Piece, PieceTy, Pos};
+use crate::game::{Color, Game, Move, PieceTy, Pos, Square};
 
 const CHECKMATE: i64 = i64::MAX;
 const DRAW: i64 = -200;
@@ -189,7 +189,7 @@ impl Engine {
 
         let piece_pos_values = game
             .get_all_pieces()
-            .map(|(p, pos)| self.piece_pos(game, p, pos) * p.color.to_int())
+            .map(|(p, pos)| self.piece_pos(game, p, pos) * p.color().to_int())
             .sum::<i64>()
             * PIECE_POS_MULT;
 
@@ -199,9 +199,9 @@ impl Engine {
 
         let bishop_counts = game
             .get_all_pieces()
-            .filter(|(p, _)| p.ty == PieceTy::Bishop)
+            .filter(|(p, _)| p.ty() == PieceTy::Bishop)
             .fold([0i64; 2], |mut acc, (p, _)| {
-                acc[p.color.to_index()] += 1;
+                acc[p.color().to_index()] += 1;
                 acc
             });
 
@@ -216,9 +216,8 @@ impl Engine {
 
     fn mobility(&self, game: &Game, color: Color) -> i64 {
         game.get_all_moves(color)
-            .map(|m| game.get(m.0).unwrap())
-            .filter(|p| p.color == color)
-            .map(|p| match p.ty {
+            .map(|m| game.get(m.0))
+            .map(|p| match p.ty() {
                 PieceTy::Knight => 4,
                 PieceTy::Bishop => 3,
                 PieceTy::Rook => 2,
@@ -235,11 +234,19 @@ impl Engine {
         }
         alpha = alpha.max(stand_pat);
 
-        for m in game
+        let mut scored: Vec<_> = game
             .get_all_moves(game.get_to_move())
             .filter(|&m| game.is_capture(m))
-        {
-            let score = -self.quiescence(&game.clone().move_change(m), -beta, -alpha, moves + 1);
+            .map(|m| {
+                let g = game.clone().move_change(m);
+                (-self.eval_base(&g, moves), (m, g))
+            })
+            .collect();
+
+        scored.sort_by(|(a, _), (b, _)| b.cmp(a));
+
+        for (_, (_, g)) in scored {
+            let score = -self.quiescence(&g, -beta, -alpha, moves + 1);
             if score >= beta {
                 return beta;
             }
@@ -253,16 +260,15 @@ impl Engine {
 
     /// white is positive
     fn get_total_piece_score(game: &Game) -> i64 {
-        game.get_board()
-            .iter()
-            .flat_map(|r| r.iter().filter_map(|p| p.map(|p| Self::piece_value(p))))
+        game.get_all_pieces()
+            .map(|p| Self::piece_value(p.0))
             .fold(0, |a, b| a + b)
     }
 
     /// white is positive
-    fn piece_value(p: Piece) -> i64 {
-        (p.color.to_int())
-            * match p.ty {
+    fn piece_value(p: Square) -> i64 {
+        (p.color().to_int())
+            * match p.ty() {
                 PieceTy::Pawn => 1,
                 PieceTy::Bishop | PieceTy::Knight => 3,
                 PieceTy::Rook => 5,
@@ -276,7 +282,7 @@ impl Engine {
         let mut major_minor: u8 = 0;
 
         for (piece, _) in game.get_all_pieces() {
-            match piece.ty {
+            match piece.ty() {
                 PieceTy::Queen => {
                     queens += 1;
                     major_minor += 1;
@@ -295,8 +301,8 @@ impl Engine {
         }
     }
 
-    fn piece_pos(&self, game: &Game, piece: Piece, pos: Pos) -> i64 {
-        let table = match piece.ty {
+    fn piece_pos(&self, game: &Game, piece: Square, pos: Pos) -> i64 {
+        let table = match piece.ty() {
             PieceTy::Pawn => [
                 [0, 0, 0, 0, 0, 0, 0, 0],
                 [50, 50, 50, 50, 50, 50, 50, 50],
@@ -371,7 +377,7 @@ impl Engine {
             },
         };
 
-        let y = if piece.color == Color::White {
+        let y = if piece.color() == Color::White {
             7 - pos.1
         } else {
             pos.1

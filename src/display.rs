@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     eval_engine::Engine,
-    game::{Color, Game, Piece, PieceTy},
+    game::{Color, Game, PieceTy, Square},
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -44,12 +44,12 @@ impl App {
         }
     }
 
-    fn get_place_char(piece: Option<Piece>) -> char {
-        let Some(piece) = piece else {
+    fn get_place_char(piece: Square) -> char {
+        if piece == Square::EMPTY {
             return ' ';
         };
 
-        match piece.ty {
+        match piece.ty() {
             PieceTy::Pawn => '♟',
             PieceTy::Rook => '♜',
             PieceTy::Knight => '♞',
@@ -200,7 +200,7 @@ impl App {
                     Style::default().bg(RColor::Rgb(197, 149, 98))
                 };
 
-                let fg_white = 1 == place.map(|p| p.color.to_int()).unwrap_or(0);
+                let fg_white = place.color().to_int() == 1;
                 let style = if fg_white {
                     style.fg(RColor::Rgb(255, 255, 255))
                 } else {
