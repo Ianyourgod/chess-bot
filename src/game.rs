@@ -396,8 +396,15 @@ impl Game {
             return;
         }
 
+        let moving = self.board[m.from.1][m.from.0];
+
+        let undo_m = Move {
+            from: m.from,
+            to: m.to,
+            promotion: m.promotion.map(|_| moving.ty()),
+        };
         let mut undo = Undo {
-            m,
+            m: undo_m,
             hash: self.get_hash(),
             en_pass: self.enpass,
             castleable: self.castleable,
@@ -407,7 +414,6 @@ impl Game {
 
         self.prev_pos.push(self.get_hash());
 
-        let moving = self.board[m.from.1][m.from.0];
         let moving_color_index = moving.color().to_index();
 
         self.hash ^= ZOBRIST_TABLE[m.from.1][m.from.0][moving.to_usize()];
@@ -629,15 +635,14 @@ impl Game {
                 let x_dist = start.0.abs_diff(end.0);
                 if x_dist == 0 {
                     if occupied {
-                        return false; // blocked
+                        return false;
                     }
-                    // straight push — valid, fall through
                 } else if x_dist == 1 {
                     if !en_pass && !occupied {
-                        return false; // diagonal must be a capture
+                        return false;
                     }
                 } else {
-                    return false; // can't move sideways more than 1
+                    return false;
                 }
             }
             PieceTy::Rook => {
@@ -797,9 +802,7 @@ impl Game {
             .filter_map(|(i, p)| (!p.is_empty()).then(|| (*p, (i % 8, i / 8))))
     }
 
-    fn under_threat_pos_board(board: &Board, pos: Pos, by: Color) -> bool {
-        let other = by;
-
+    fn under_threat_pos_board(board: &Board, pos: Pos, other: Color) -> bool {
         let get = |p: Pos| board[p.1][p.0];
 
         // pawn
@@ -989,6 +992,14 @@ impl Game {
                             (pos.0, y, Some(PieceTy::Rook)),
                             (pos.0, y, Some(PieceTy::Knight)),
                             (pos.0, y, Some(PieceTy::Bishop)),
+                            (pos.0 - 1, y, Some(PieceTy::Queen)),
+                            (pos.0 - 1, y, Some(PieceTy::Rook)),
+                            (pos.0 - 1, y, Some(PieceTy::Knight)),
+                            (pos.0 - 1, y, Some(PieceTy::Bishop)),
+                            (pos.0 + 1, y, Some(PieceTy::Queen)),
+                            (pos.0 + 1, y, Some(PieceTy::Rook)),
+                            (pos.0 + 1, y, Some(PieceTy::Knight)),
+                            (pos.0 + 1, y, Some(PieceTy::Bishop)),
                             (pos.0, y + pawn_move_dir, None), // move 2 tiles
                             (pos.0 - 1, y, None),
                             (pos.0 + 1, y, None),

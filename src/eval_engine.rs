@@ -61,11 +61,13 @@ impl Engine {
 
         self.start_time = std::time::Instant::now();
         loop {
+            /*
             println!(
                 "depth {} at {}ms",
                 depth,
                 self.start_time.elapsed().as_millis()
             );
+            */
 
             if best.0 == CHECKMATE || self.timed_out(depth) {
                 break (best.0, best.1, depth);
@@ -237,8 +239,7 @@ impl Engine {
             .sum::<i64>()
             * PIECE_POS_MULT;
 
-        // TODO: reenable this once we make
-        // mobility better (cheaper)
+        // TODO: reenable this once we make mobility better (cheaper)
         let mobility = 0; /*(self.mobility(game, game.get_to_move())
         - self.mobility(game, game.get_to_move().other()))
          * MOBILITY_MULT;*/

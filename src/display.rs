@@ -107,6 +107,7 @@ impl App {
                 && self.board.get_to_move() == bot_color
             {
                 let engine_move = self.engine.best_move(&mut self.board);
+                //eprintln!("{:?}", engine_move);
                 self.board.move_piece(engine_move.1);
                 depth = engine_move.2;
             }
@@ -152,9 +153,7 @@ impl App {
 
                                 promotion_p = None;
                             } else {
-                                if selected.is_none() {
-                                    selected = Some(cursor_pos);
-                                } else if let Some(s) = selected {
+                                if let Some(s) = selected {
                                     selected = None;
 
                                     let m = Move {
@@ -164,15 +163,16 @@ impl App {
                                     };
 
                                     if s != cursor_pos && self.board.is_valid(m) {
-                                        if self.board.get(m.from).ty() == PieceTy::Pawn {
-                                            if m.to.1 == 0 || m.to.1 == 7 {
-                                                // promotion
-                                                promotion_p = Some((m, 0))
-                                            }
+                                        if self.board.get(m.from).ty() == PieceTy::Pawn
+                                            && (m.to.1 == 0 || m.to.1 == 7)
+                                        {
+                                            promotion_p = Some((m, 0))
                                         } else {
                                             self.board.move_piece(m);
                                         }
                                     }
+                                } else {
+                                    selected = Some(cursor_pos);
                                 }
                             }
                         }

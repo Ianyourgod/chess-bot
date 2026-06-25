@@ -44,7 +44,7 @@ fn bot_on_bot() {
 
 #[allow(unused)]
 fn player_vs_bot() {
-    let game = game::Game::from_fen("rnbqkbnr/Pppppppp/8/8/8/8/1PPPPPPP/RNBQKBNR w");
+    let game = game::Game::default();
 
     display::player_vs_bot(game, game::Color::Black);
 }
