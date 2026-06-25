@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::{
-    eval_engine::Engine,
-    game::{Color, Game, PieceTy, Square},
+    eval_engine::{CalcConstraint, Engine},
+    game::{Color, Game, Move, PieceTy, Square},
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -40,7 +40,7 @@ impl App {
     pub fn new(board: Game) -> Self {
         Self {
             board,
-            engine: Engine::new(std::time::Duration::from_millis(5000)),
+            engine: Engine::new(CalcConstraint::Time(Duration::from_millis(5000))), // TODO: make this a parameter
         }
     }
 
@@ -67,7 +67,7 @@ impl App {
             if !self.board.checkmate(self.board.get_to_move())
                 && !self.board.stalemate(self.board.get_to_move())
             {
-                let engine_move = self.engine.best_move(&self.board);
+                let engine_move = self.engine.best_move(&mut self.board);
                 self.board.move_piece(engine_move.1);
                 depth = engine_move.2;
             }
@@ -95,6 +95,8 @@ impl App {
         let mut cursor_pos = (0, 0);
         let mut selected = None;
 
+        let mut promotion_p: Option<(Move, u8)> = None;
+
         loop {
             let render =
                 |frame: &mut Frame| self.render(frame, depth, Some((cursor_pos, selected)));
@@ -104,7 +106,7 @@ impl App {
                 && !self.board.stalemate(self.board.get_to_move())
                 && self.board.get_to_move() == bot_color
             {
-                let engine_move = self.engine.best_move(&self.board);
+                let engine_move = self.engine.best_move(&mut self.board);
                 self.board.move_piece(engine_move.1);
                 depth = engine_move.2;
             }
@@ -133,20 +135,55 @@ impl App {
                             ()
                         }
                         KeyCode::Enter => {
-                            if selected.is_none() {
-                                selected = Some(cursor_pos);
-                            } else if let Some(s) = selected {
-                                selected = None;
+                            if let Some((m, n)) = promotion_p {
+                                let ty = match n {
+                                    0 => PieceTy::Queen,
+                                    1 => PieceTy::Rook,
+                                    2 => PieceTy::Bishop,
+                                    3 => PieceTy::Knight,
+                                    _ => unreachable!(),
+                                };
 
-                                let m = (
-                                    (s.0 as usize, s.1 as usize),
-                                    (cursor_pos.0 as usize, cursor_pos.1 as usize),
-                                );
-                                if s != cursor_pos && self.board.is_valid(m) {
-                                    self.board.move_piece(m);
+                                self.board.move_piece(Move {
+                                    from: m.from,
+                                    to: m.to,
+                                    promotion: Some(ty),
+                                });
+
+                                promotion_p = None;
+                            } else {
+                                if selected.is_none() {
+                                    selected = Some(cursor_pos);
+                                } else if let Some(s) = selected {
+                                    selected = None;
+
+                                    let m = Move {
+                                        from: (s.0 as usize, s.1 as usize),
+                                        to: (cursor_pos.0 as usize, cursor_pos.1 as usize),
+                                        promotion: None,
+                                    };
+
+                                    if s != cursor_pos && self.board.is_valid(m) {
+                                        if self.board.get(m.from).ty() == PieceTy::Pawn {
+                                            if m.to.1 == 0 || m.to.1 == 7 {
+                                                // promotion
+                                                promotion_p = Some((m, 0))
+                                            }
+                                        } else {
+                                            self.board.move_piece(m);
+                                        }
+                                    }
                                 }
                             }
                         }
+
+                        KeyCode::Left if let Some((m, p)) = promotion_p => {
+                            promotion_p = Some((m, (p - 1) % 4))
+                        }
+                        KeyCode::Right if let Some((m, p)) = promotion_p => {
+                            promotion_p = Some((m, (p + 1) % 4))
+                        }
+
                         KeyCode::Up => cursor_pos = correct_pos((cursor_pos.0, cursor_pos.1 + 1)),
                         KeyCode::Down => cursor_pos = correct_pos((cursor_pos.0, cursor_pos.1 - 1)),
                         KeyCode::Left => cursor_pos = correct_pos((cursor_pos.0 - 1, cursor_pos.1)),
