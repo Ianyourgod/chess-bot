@@ -13,7 +13,7 @@ fn main() {
 
     match p.as_str() {
         "flame" => flame_on(
-            args.next().map(|n| n.parse::<u32>().unwrap()).unwrap_or(8),
+            args.next().map(|n| n.parse::<u16>().unwrap()).unwrap_or(8),
             args.next()
                 .map(|n| n.parse::<u64>().unwrap())
                 .unwrap_or(3000),
@@ -22,8 +22,11 @@ fn main() {
         "otherbot" => otherbot(),
         "speed" => println!(
             "speed: {}ms",
-            speed(args.next().map(|n| n.parse::<u32>().unwrap()).unwrap_or(7)).as_millis()
+            speed(args.next().map(|n| n.parse::<u16>().unwrap()).unwrap_or(7)).as_millis()
         ),
+        "test_possible" => {
+            test_possible(args.next().map(|n| n.parse::<u16>().unwrap()).unwrap_or(7))
+        }
         c => panic!("unknown arg \"{c}\""),
     }
 }
@@ -57,7 +60,7 @@ fn otherbot() {
 }
 
 #[allow(unused)]
-fn flame_on(moves: u32, time_ms: u64) {
+fn flame_on(moves: u16, time_ms: u64) {
     let wait_time = eval_engine::CalcConstraint::Time(std::time::Duration::from_millis(time_ms));
 
     let mut game = game::Game::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq c3");
@@ -73,7 +76,7 @@ fn flame_on(moves: u32, time_ms: u64) {
     }
 }
 
-fn speed(depth: u32) -> std::time::Duration {
+fn speed(depth: u16) -> std::time::Duration {
     let wait_time = eval_engine::CalcConstraint::Depth(depth);
 
     let mut game = game::Game::default();
@@ -83,4 +86,32 @@ fn speed(depth: u32) -> std::time::Duration {
     engine.best_move(&mut game);
 
     engine.elapsed()
+}
+
+// TODO: add tests so we can just run cargo test
+fn test_possible(depth: u16) {
+    let mut game = game::Game::default();
+
+    fn explore(game: &mut game::Game, depth: u16) -> usize {
+        if depth == 0 {
+            return 1;
+        }
+
+        game.get_all_moves(game.get_to_move())
+            .into_iter()
+            .map(|m| {
+                game.move_piece(m);
+                let n = explore(game, depth - 1);
+                game.undo_move();
+
+                n
+            })
+            .sum()
+    }
+
+    println!(
+        "at depth {}, there are {} nodes",
+        depth,
+        explore(&mut game, depth)
+    )
 }

@@ -44,7 +44,15 @@ pub enum PieceTy {
     King = 6,
 }
 
+const BB_PAWN: usize = 0;
+const BB_KNIGHT: usize = 1;
+const BB_BISHOP: usize = 2;
+const BB_ROOK: usize = 3;
+const BB_QUEEN: usize = 4;
+const BB_KING: usize = 5;
+
 impl PieceTy {
+    #[inline]
     pub fn from_u8(n: u8) -> Self {
         match n {
             1 => Self::Pawn,
@@ -55,6 +63,11 @@ impl PieceTy {
             6 => Self::King,
             n => unreachable!("found {n}"),
         }
+    }
+
+    #[inline]
+    pub fn to_u8(self) -> u8 {
+        self as u8
     }
 }
 
@@ -196,6 +209,7 @@ impl PrevPos {
 
 #[derive(Debug, Clone, PartialEq)]
 struct Undo {
+    moving: Square,
     capture: Option<(Square, Pos)>,
     castleable: [(bool, bool); 2],
     en_pass: Option<Pos>,
@@ -203,9 +217,93 @@ struct Undo {
     m: Move,
 }
 
+type BB = u64;
+
+#[inline]
+pub fn sq(pos: Pos) -> u32 {
+    (pos.1 * 8 + pos.0) as u32
+}
+#[inline]
+fn sq_to_pos(sq: u32) -> Pos {
+    ((sq % 8) as usize, (sq / 8) as usize)
+}
+#[inline]
+fn bit(sq: u32) -> BB {
+    1u64 << sq
+}
+#[inline]
+fn pop_lsb(bb: &mut BB) -> u32 {
+    let sq = bb.trailing_zeros();
+    *bb &= *bb - 1;
+    sq
+}
+#[inline]
+fn shift(bb: BB, n: i32) -> BB {
+    if n > 0 { bb << n } else { bb >> -n }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BitBoards {
+    pub pieces: [[BB; 6]; 2],
+    pub color: [BB; 2],
+    pub all: BB,
+}
+
+impl BitBoards {
+    pub fn from_board(b: Board) -> Self {
+        let mut s = Self {
+            pieces: [[0; 6]; 2],
+            color: [0; 2],
+            all: 0,
+        };
+
+        for (idx, sq) in b
+            .as_flattened()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.is_empty())
+        {
+            let b = bit(idx as u32);
+
+            s.all |= b;
+
+            let color_idx = sq.color().to_index();
+            s.color[color_idx] |= b;
+
+            let piece_idx = (sq.ty().to_u8() - 1) as usize;
+            s.pieces[color_idx][piece_idx] |= b;
+        }
+
+        s
+    }
+
+    pub fn get(&self, p: Pos) -> Square {
+        let b = bit(sq(p));
+
+        if self.all & b == 0 {
+            return Square::EMPTY;
+        }
+
+        let (color, c_idx) = if self.color[0] & b != 0 {
+            (Color::White, 0)
+        } else {
+            (Color::Black, 1)
+        };
+
+        let ty =
+            PieceTy::from_u8((0..6).find(|&n| self.pieces[c_idx][n] & b != 0).unwrap() as u8 + 1);
+
+        Square::piece(ty, color)
+    }
+
+    pub fn occupied(&self, p: Pos) -> bool {
+        self.all & bit(sq(p)) != 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Game {
-    board: Board,
+    board: BitBoards,
     to_move: Color,
     castleable: [(bool, bool); 2],
     enpass: Option<Pos>,
@@ -224,6 +322,7 @@ impl Game {
         to_move: Color,
     ) -> Self {
         let hash = Self::gen_full_hash(&board, to_move, castleable, enpass);
+        let board = BitBoards::from_board(board);
         Self {
             board,
             castleable,
@@ -354,7 +453,6 @@ impl Game {
             None
         };
 
-        // TODO: use new
         Self::new(board, castleable, enpass, to_move)
     }
 
@@ -386,125 +484,204 @@ impl Game {
             >= 2
     }
 
-    #[inline]
-    pub fn get_rank(&self, n: usize) -> &[Square; 8] {
-        &self.board[n]
+    pub fn hash_after_move(&self, m: Move) -> u64 {
+        let mut hash = self.hash;
+        let moving = self.get(m.from);
+
+        let c = moving.color().to_index();
+        let ec = 1 - c;
+
+        let ep_capture = moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass;
+        let capture = if ep_capture {
+            let cap_pos = (m.to.0, m.from.1);
+            Some((self.get(cap_pos), cap_pos))
+        } else {
+            let t = self.get(m.to);
+            (!t.is_empty()).then_some((t, m.to))
+        };
+
+        hash ^= ZOBRIST_TABLE[m.from.1][m.from.0][moving.to_usize()];
+
+        if ep_capture {
+            let cap_pos = (m.to.0, m.from.1);
+            let cap_sq = self.get(cap_pos);
+            hash ^= ZOBRIST_TABLE[cap_pos.1][cap_pos.0][cap_sq.to_usize() - 1];
+        }
+        if let Some(ep) = self.enpass {
+            hash ^= ZOBRIST_ENPASS[ep.0];
+        }
+        if moving.ty() == PieceTy::Pawn && m.from.1.abs_diff(m.to.1) == 2 {
+            hash ^= ZOBRIST_ENPASS[m.to.0];
+        }
+
+        let old_cas = self.castleable;
+        let mut new_cas = self.castleable;
+        if moving.ty() == PieceTy::King {
+            new_cas[c] = (false, false);
+        }
+        if moving.ty() == PieceTy::Rook && m.from.1 == moving.color().start() {
+            match m.from.0 {
+                0 => new_cas[c].0 = false,
+                7 => new_cas[c].1 = false,
+                _ => {}
+            }
+        }
+        if let Some((cap, cap_pos)) = capture.filter(|_| !ep_capture) {
+            if cap.ty() == PieceTy::Rook && cap_pos.1 == cap.color().start() {
+                match cap_pos.0 {
+                    0 => new_cas[ec].0 = false,
+                    7 => new_cas[ec].1 = false,
+                    _ => {}
+                }
+            }
+        }
+        for color_idx in 0..2 {
+            if old_cas[color_idx].0 != new_cas[color_idx].0 {
+                hash ^= ZOBRIST_CASTLING[color_idx][0];
+            }
+            if old_cas[color_idx].1 != new_cas[color_idx].1 {
+                hash ^= ZOBRIST_CASTLING[color_idx][1];
+            }
+        }
+
+        if moving.ty() == PieceTy::King && m.from.0.abs_diff(m.to.0) == 2 {
+            let rank = m.from.1;
+            let (rx, rfinal) = if m.to.0 < m.from.0 { (0, 3) } else { (7, 5) };
+            let rook = self.get((rx, rank));
+            hash ^= ZOBRIST_TABLE[rank][rx][rook.to_usize()];
+            hash ^= ZOBRIST_TABLE[rank][rfinal][rook.to_usize()];
+        }
+
+        if let Some((cap, _)) = capture.filter(|_| !ep_capture) {
+            hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][cap.to_usize()];
+        }
+
+        let final_sq = match m.promotion {
+            Some(p) => Square::piece(p, moving.color()),
+            None => moving,
+        };
+        hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][final_sq.to_usize()];
+
+        hash ^= *ZOBRIST_SIDE_TO_MOVE;
+
+        hash
     }
 
     pub fn move_piece(&mut self, m: Move) {
-        if m.from == m.to {
-            return;
-        }
+        let moving = self.get(m.from);
 
-        let moving = self.board[m.from.1][m.from.0];
+        let c = moving.color().to_index();
+        let ec = 1 - c;
+        let pt = moving.ty() as usize - 1;
+        let from_bit = bit(sq(m.from));
+        let to_bit = bit(sq(m.to));
 
-        let undo_m = Move {
-            from: m.from,
-            to: m.to,
-            promotion: m.promotion.map(|_| moving.ty()),
+        let ep_capture = moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass;
+        let capture = if ep_capture {
+            let cap_pos = (m.to.0, m.from.1);
+            Some((self.get(cap_pos), cap_pos))
+        } else {
+            let t = self.get(m.to);
+            (!t.is_empty()).then_some((t, m.to))
         };
-        let mut undo = Undo {
-            m: undo_m,
-            hash: self.get_hash(),
-            en_pass: self.enpass,
+
+        self.prev_pos.push(self.hash);
+        self.moves.push(Undo {
+            moving,
+            capture,
             castleable: self.castleable,
-            capture: (!self.board[m.to.1][m.to.0].is_empty())
-                .then_some((self.board[m.to.1][m.to.0], m.to)),
-        };
-
-        self.prev_pos.push(self.get_hash());
-
-        let moving_color_index = moving.color().to_index();
+            en_pass: self.enpass,
+            hash: self.hash,
+            m,
+        });
 
         self.hash ^= ZOBRIST_TABLE[m.from.1][m.from.0][moving.to_usize()];
 
-        if moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass {
-            let target = (m.to.0, m.from.1);
-            undo.capture = Some((self.get(target), target));
-            self.hash ^= ZOBRIST_TABLE[m.from.1][m.to.0][self.board[m.from.1][m.to.0].to_usize()];
-            self.board[target.1][target.0] = Square::EMPTY; // y of start, x of end
+        if ep_capture {
+            let cap_pos = (m.to.0, m.from.1);
+            let cap_sq = self.get(cap_pos);
+            let cap_bit = bit(sq(cap_pos));
+            self.hash ^= ZOBRIST_TABLE[cap_pos.1][cap_pos.0][cap_sq.to_usize()];
+            self.board.pieces[ec][BB_PAWN] &= !cap_bit;
+            self.board.color[ec] &= !cap_bit;
+            self.board.all &= !cap_bit;
         }
-        if let Some(e) = self.enpass {
-            self.hash ^= ZOBRIST_ENPASS[e.0];
+
+        if let Some(ep) = self.enpass {
+            self.hash ^= ZOBRIST_ENPASS[ep.0];
         }
         self.enpass = None;
-        if moving.ty() == PieceTy::Pawn && (m.from.1.abs_diff(m.to.1) == 2) {
+        if moving.ty() == PieceTy::Pawn && m.from.1.abs_diff(m.to.1) == 2 {
             let mid_y = (m.from.1 + m.to.1) / 2;
             self.enpass = Some((m.to.0, mid_y));
             self.hash ^= ZOBRIST_ENPASS[m.to.0];
         }
 
-        let cas = [
-            (self.castleable[moving_color_index], moving_color_index),
-            (
-                self.castleable[moving.color().other().to_index()],
-                moving.color().other().to_index(),
-            ),
-        ];
+        let old_cas = self.castleable;
         if moving.ty() == PieceTy::King {
-            self.castleable[moving_color_index] = (false, false);
+            self.castleable[c] = (false, false);
         }
-        if moving.ty() == PieceTy::Rook && m.from.1 == moving_color_index * 7 {
-            if m.from.0 == 0 {
-                self.castleable[moving_color_index].0 = false;
-            } else if m.from.0 == 7 {
-                self.castleable[moving_color_index].1 = false;
+        if moving.ty() == PieceTy::Rook && m.from.1 == moving.color().start() {
+            match m.from.0 {
+                0 => self.castleable[c].0 = false,
+                7 => self.castleable[c].1 = false,
+                _ => {}
             }
         }
-        if let rook = self.get(m.to)
-            && rook != Square::EMPTY
-            && m.to.1 == rook.color().start()
-            && rook.ty() == PieceTy::Rook
-        {
-            if m.to.0 == 0 {
-                self.castleable[moving.color().other().to_index()].0 = false;
-            } else if m.to.0 == 7 {
-                self.castleable[moving.color().other().to_index()].1 = false;
+        if let Some((cap, cap_pos)) = capture.filter(|_| !ep_capture) {
+            if cap.ty() == PieceTy::Rook && cap_pos.1 == cap.color().start() {
+                match cap_pos.0 {
+                    0 => self.castleable[ec].0 = false,
+                    7 => self.castleable[ec].1 = false,
+                    _ => {}
+                }
             }
         }
-
-        for (cas, idx) in cas {
-            if self.castleable[idx].0 != cas.0 {
-                self.hash ^= ZOBRIST_CASTLING[idx][0];
+        for color_idx in 0..2 {
+            if old_cas[color_idx].0 != self.castleable[color_idx].0 {
+                self.hash ^= ZOBRIST_CASTLING[color_idx][0];
             }
-            if self.castleable[idx].1 != cas.1 {
-                self.hash ^= ZOBRIST_CASTLING[idx][1];
+            if old_cas[color_idx].1 != self.castleable[color_idx].1 {
+                self.hash ^= ZOBRIST_CASTLING[color_idx][1];
             }
         }
 
         if moving.ty() == PieceTy::King && m.from.0.abs_diff(m.to.0) == 2 {
-            // castling
-            // we move the rook too
-            let (rook_x, rook_final) = if m.from.0 > m.to.0 { (0, 3) } else { (7, 5) };
-            let rook = self.board[m.from.1][rook_x];
-            self.board[m.from.1][rook_final] = self.board[m.from.1][rook_x];
-            self.board[m.from.1][rook_x] = Square::EMPTY;
-            self.hash ^= ZOBRIST_TABLE[m.from.1][rook_final][rook.to_usize()];
-            self.hash ^= ZOBRIST_TABLE[m.from.1][rook_x][rook.to_usize()];
+            let rank = m.from.1;
+            let (rx, rfinal) = if m.to.0 < m.from.0 { (0, 3) } else { (7, 5) };
+            let rook = self.get((rx, rank));
+            let r_from_bit = 1u64 << sq((rx, rank));
+            let r_to_bit = 1u64 << sq((rfinal, rank));
+            self.hash ^= ZOBRIST_TABLE[rank][rx][rook.to_usize()];
+            self.hash ^= ZOBRIST_TABLE[rank][rfinal][rook.to_usize()];
+            self.board.pieces[c][BB_ROOK] =
+                (self.board.pieces[c][BB_ROOK] & !r_from_bit) | r_to_bit;
+            self.board.color[c] = (self.board.color[c] & !r_from_bit) | r_to_bit;
+            self.board.all = (self.board.all & !r_from_bit) | r_to_bit;
         }
 
-        if let captured = self.board[m.to.1][m.to.0]
-            && !captured.is_empty()
-        {
-            self.hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][captured.to_usize()];
+        if let Some((cap, _)) = capture.filter(|_| !ep_capture) {
+            let cpt = cap.ty() as usize - 1;
+            self.hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][cap.to_usize()];
+            self.board.pieces[ec][cpt] &= !to_bit;
+            self.board.color[ec] &= !to_bit;
         }
 
-        self.board[m.to.1][m.to.0] = self.board[m.from.1][m.from.0];
-        self.board[m.from.1][m.from.0] = Square::EMPTY;
+        self.board.pieces[c][pt] &= !from_bit;
+        self.board.color[c] &= !from_bit;
+        self.board.all &= !from_bit;
 
-        if let Some(p) = m.promotion {
-            let promoted = Square::piece(p, moving.color());
-            self.hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][promoted.to_usize()];
-            self.board[m.to.1][m.to.0] = promoted;
-        } else {
-            self.hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][moving.to_usize()];
-        }
+        let (final_pt, final_sq) = match m.promotion {
+            Some(p) => (p as usize - 1, Square::piece(p, moving.color())),
+            None => (pt, moving),
+        };
+        self.hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][final_sq.to_usize()];
+        self.board.pieces[c][final_pt] |= to_bit;
+        self.board.color[c] |= to_bit;
+        self.board.all |= to_bit;
 
         self.hash ^= *ZOBRIST_SIDE_TO_MOVE;
-
         self.to_move = self.to_move.other();
-
-        self.moves.push(undo);
     }
 
     pub fn undo_move(&mut self) {
@@ -514,272 +691,317 @@ impl Game {
         self.hash = undo.hash;
         self.castleable = undo.castleable;
         self.enpass = undo.en_pass;
-
-        if self.get(undo.m.to).ty() == PieceTy::King && undo.m.from.0.abs_diff(undo.m.to.0) == 2 {
-            let (rook_now, rook_origin) = if undo.m.from.0 > undo.m.to.0 {
-                (3, 0)
-            } else {
-                (5, 7)
-            };
-            self.board[undo.m.from.1][rook_origin] = self.board[undo.m.from.1][rook_now];
-            self.board[undo.m.from.1][rook_now] = Square::EMPTY;
-        }
-
-        self.board[undo.m.from.1][undo.m.from.0] = if let Some(p) = undo.m.promotion {
-            Square::piece(p, self.get(undo.m.to).color())
-        } else {
-            self.get(undo.m.to)
-        };
-        self.board[undo.m.to.1][undo.m.to.0] = Square::EMPTY;
-        if let Some(cap) = undo.capture {
-            self.board[cap.1.1][cap.1.0] = cap.0;
-        }
-
         self.prev_pos.undo();
-    }
 
-    pub fn move_piece_board(&self, m: Move, b: &mut Board) {
-        if m.from == m.to {
-            return;
+        if undo.m.from == undo.m.to {
+            return; // null move
         }
 
-        let moving = b[m.from.1][m.from.0];
+        let m = undo.m;
+        let moving = undo.moving;
+        let c = moving.color().to_index();
+        let pt = moving.ty() as usize - 1;
+        let from_bit = bit(sq(m.from));
+        let to_bit = bit(sq(m.to));
+        let final_pt = m.promotion.map(|p| p as usize - 1).unwrap_or(pt);
 
-        if moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass {
-            b[m.from.1][m.to.0] = Square::EMPTY; // y of start, x of end
+        self.board.pieces[c][final_pt] &= !to_bit;
+        self.board.color[c] &= !to_bit;
+        self.board.all &= !to_bit;
+
+        self.board.pieces[c][pt] |= from_bit;
+        self.board.color[c] |= from_bit;
+        self.board.all |= from_bit;
+
+        if let Some((cap, cap_pos)) = undo.capture {
+            let cap_bit = bit(sq(cap_pos));
+            let cpt = cap.ty() as usize - 1;
+            let cec = cap.color().to_index();
+            self.board.pieces[cec][cpt] |= cap_bit;
+            self.board.color[cec] |= cap_bit;
+            self.board.all |= cap_bit;
         }
 
         if moving.ty() == PieceTy::King && m.from.0.abs_diff(m.to.0) == 2 {
-            let (rook_x, rook_final) = if m.from.0 > m.to.0 { (0, 3) } else { (7, 5) };
-            b[m.from.1][rook_final] = b[m.from.1][rook_x];
-            b[m.from.1][rook_x] = Square::EMPTY;
+            let rank = m.from.1;
+            let (rx, rfinal) = if m.to.0 < m.from.0 { (0, 3) } else { (7, 5) };
+            let r_origin_bit = bit(sq((rx, rank)));
+            let r_moved_bit = bit(sq((rfinal, rank)));
+            self.board.pieces[c][BB_ROOK] =
+                (self.board.pieces[c][BB_ROOK] & !r_moved_bit) | r_origin_bit;
+            self.board.color[c] = (self.board.color[c] & !r_moved_bit) | r_origin_bit;
+            self.board.all = (self.board.all & !r_moved_bit) | r_origin_bit;
+        }
+    }
+
+    pub fn make_null_move(&mut self) {
+        // TODO: technically, this (prev_pos) might cause issues as we might see a repeat
+        // thats like not exactly real
+        // BUT its just for null move pruning so who cares
+        self.prev_pos.push(self.get_hash());
+        self.moves.push(Undo {
+            moving: Square::EMPTY,
+            capture: None,
+            castleable: self.castleable,
+            hash: self.get_hash(),
+            en_pass: self.enpass,
+            m: Move {
+                from: (8, 8),
+                to: (8, 8),
+                promotion: None,
+            },
+        });
+        self.to_move = self.to_move.other();
+        self.hash ^= *ZOBRIST_SIDE_TO_MOVE;
+        if let Some(ep) = self.enpass {
+            self.hash ^= ZOBRIST_ENPASS[ep.0];
+        }
+        self.enpass = None;
+    }
+
+    fn apply_move_board(&self, bb: &mut BitBoards, m: Move, moving: Square) {
+        let c = moving.color().to_index();
+        let from_bit = 1u64 << sq(m.from);
+        let to_bit = 1u64 << sq(m.to);
+        let pt = moving.ty() as usize - 1;
+
+        bb.pieces[c][pt] &= !from_bit;
+        bb.color[c] &= !from_bit;
+        bb.all &= !from_bit;
+
+        let cap = self.get(m.to);
+        if !cap.is_empty() {
+            let ec = cap.color().to_index();
+            let ept = cap.ty() as usize - 1;
+            bb.pieces[ec][ept] &= !to_bit;
+            bb.color[ec] &= !to_bit;
         }
 
-        if let Some(p) = m.promotion {
-            b[m.to.1][m.to.0] = Square::piece(p, moving.color());
-        } else {
-            b[m.to.1][m.to.0] = b[m.from.1][m.from.0];
+        if moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass {
+            let ep_bit = 1u64 << sq((m.to.0, m.from.1));
+            let ec = moving.color().other().to_index();
+            bb.pieces[ec][BB_PAWN] &= !ep_bit;
+            bb.color[ec] &= !ep_bit;
+            bb.all &= !ep_bit;
         }
-        b[m.from.1][m.from.0] = Square::EMPTY;
+
+        let final_pt = m.promotion.map(|p| p as usize - 1).unwrap_or(pt);
+        bb.pieces[c][final_pt] |= to_bit;
+        bb.color[c] |= to_bit;
+        bb.all |= to_bit;
+
+        if moving.ty() == PieceTy::King && m.from.0.abs_diff(m.to.0) == 2 {
+            let rank = m.from.1;
+            let (rx, rfinal) = if m.to.0 < m.from.0 { (0, 3) } else { (7, 5) };
+            let rf = 1u64 << sq((rx, rank));
+            let rt = 1u64 << sq((rfinal, rank));
+            bb.pieces[c][BB_ROOK] = (bb.pieces[c][BB_ROOK] & !rf) | rt;
+            bb.color[c] = (bb.color[c] & !rf) | rt;
+            bb.all = (bb.all & !rf) | rt;
+        }
     }
 
     #[inline]
     pub fn occupied(&self, p: Pos) -> bool {
-        !self.board[p.1][p.0].is_empty()
+        self.board.occupied(p)
     }
 
     pub fn is_valid(&self, m: Move) -> bool {
-        let start = m.from;
-        let end = m.to;
-
-        if start == end {
+        if m.from.0 >= 8 || m.from.1 >= 8 || m.to.0 >= 8 || m.to.1 >= 8 {
+            return false;
+        }
+        if m.from == m.to {
             return false;
         }
 
-        let piece = self.board[start.1][start.0];
+        let piece = self.get(m.from);
         if piece.is_empty() {
             return false;
         }
 
-        if let p = self.get(end)
-            && p != Square::EMPTY
-            && (p.ty() == PieceTy::King || p.color() == piece.color())
-        {
+        let color = piece.color();
+        let c = color.to_index();
+        let from_sq = sq(m.from);
+        let to_sq = sq(m.to);
+        let to_bit = 1u64 << to_sq;
+        let all = self.board.all;
+
+        let target = self.get(m.to);
+        if !target.is_empty() && (target.color() == color || target.ty() == PieceTy::King) {
             return false;
         }
 
-        match piece.ty() {
-            PieceTy::Bishop => {
-                let x_change = end.0 as i8 - start.0 as i8;
-                let y_change = end.1 as i8 - start.1 as i8;
-
-                if x_change.abs() != y_change.abs() {
-                    return false;
-                }
-
-                // one less as we don't care whether the target is occupied
-                for delta in 1..(x_change.abs()) {
-                    let dx = delta * x_change.signum();
-                    let dy = delta * y_change.signum();
-
-                    let pos = ((start.0 as i8 + dx) as usize, (start.1 as i8 + dy) as usize);
-
-                    if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
-                        return false;
-                    }
-                }
-            }
-            PieceTy::Pawn => {
-                let move_dir = piece.color().to_int() as i8;
-
-                let occupied = self.occupied(end);
-
-                let front = match piece.color() {
-                    Color::Black => 6,
-                    Color::White => 1,
-                };
-                let can_be_double = start.1 == front;
-
-                if start.1 as i8 + move_dir != end.1 as i8 {
-                    if !(can_be_double && start.1 as i8 + move_dir * 2 == end.1 as i8)
-                        || self.occupied((start.0, (start.1 as i8 + move_dir) as usize))
-                    {
-                        return false;
-                    }
-                }
-
-                let en_pass = !occupied
-                    && Some(end) == self.enpass
-                    && self.get((end.0, start.1)).color() == piece.color().other();
-
-                let x_dist = start.0.abs_diff(end.0);
-                if x_dist == 0 {
-                    if occupied {
-                        return false;
-                    }
-                } else if x_dist == 1 {
-                    if !en_pass && !occupied {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
-            PieceTy::Rook => {
-                let vertical = start.1 != end.1;
-                let horizontal = start.0 != end.0;
-
-                if !(vertical ^ horizontal) {
-                    return false;
-                }
-
-                let man_dist = (start.1.abs_diff(end.1) + start.0.abs_diff(end.0)) as i8;
-                let neg = start.1 > end.1 || start.0 > end.0;
-
-                // one less as we don't care whether the target is occupied
-                for delta in 1..man_dist {
-                    let delta = if neg { -delta } else { delta };
-                    let pos = if vertical {
-                        (start.0, (start.1 as i8 + delta) as usize)
-                    } else {
-                        ((start.0 as i8 + delta) as usize, start.1)
-                    };
-
-                    if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
-                        return false;
-                    }
-                }
-            }
-            PieceTy::King => {
-                let x_change = start.0.abs_diff(end.0);
-                let y_change = start.1.abs_diff(end.1);
-
-                if x_change == 2 && y_change == 0 {
-                    let color_idx = piece.color().to_index();
-                    let (legal, rook_x_ish, rook_final) = if m.from.0 > m.to.0 {
-                        (self.castleable[color_idx].0, 1, 3)
-                    } else {
-                        (self.castleable[color_idx].1, 6, 5)
-                    };
-                    if !legal {
-                        return false;
-                    }
-
-                    if self.check(piece.color()) {
-                        return false;
-                    }
-
-                    let empty_start = rook_final.min(rook_x_ish);
-                    let empty_end = rook_final + rook_x_ish - empty_start;
-                    for x in empty_start..=empty_end {
-                        if self.occupied((x, m.from.1)) {
-                            return false;
-                        }
-                    }
-
-                    let safe_start = m.to.0.min(rook_final);
-                    let safe_end = m.to.0.max(rook_final);
-                    for x in safe_start..=safe_end {
-                        if self.under_threat_pos((x, m.from.1), piece.color().other()) {
-                            return false;
-                        }
-                    }
-                } else if x_change > 1 || y_change > 1 {
-                    return false;
-                }
-            }
+        let geom_ok = match piece.ty() {
+            PieceTy::Pawn => self.is_valid_pawn(m, color),
             PieceTy::Knight => {
-                let x_change = start.0.abs_diff(end.0);
-                let y_change = start.1.abs_diff(end.1);
-
-                if !((x_change == 2) ^ (y_change == 2)) || !((x_change == 1) ^ (y_change == 1)) {
-                    return false;
-                }
+                m.promotion.is_none() && KNIGHT_ATTACKS[from_sq as usize] & to_bit != 0
             }
+            PieceTy::Bishop => m.promotion.is_none() && bishop_attacks(from_sq, all) & to_bit != 0,
+            PieceTy::Rook => m.promotion.is_none() && rook_attacks(from_sq, all) & to_bit != 0,
             PieceTy::Queen => {
-                let x_change = start.0.abs_diff(end.0);
-                let y_change = start.1.abs_diff(end.1);
+                m.promotion.is_none()
+                    && (bishop_attacks(from_sq, all) | rook_attacks(from_sq, all)) & to_bit != 0
+            }
+            PieceTy::King => self.is_valid_king(m, color, c),
+        };
 
-                if x_change == 0 || y_change == 0 {
-                    // rook-like movement
-                    let vertical = start.1 != end.1;
-                    let horizontal = start.0 != end.0;
+        if !geom_ok {
+            return false;
+        }
 
-                    if !(vertical ^ horizontal) {
-                        return false;
-                    }
+        self.move_is_legal(m)
+    }
 
-                    let man_dist = (start.1.abs_diff(end.1) + start.0.abs_diff(end.0)) as i8;
-                    let neg = start.1 > end.1 || start.0 > end.0;
+    pub fn move_is_legal_fast(&self, m: Move, in_check: bool) -> bool {
+        let moving = self.get(m.from);
+        let c = moving.color().to_index();
+        let ec = 1 - c;
+        let king_sq = self.board.pieces[c][BB_KING].trailing_zeros();
 
-                    // one less as we don't care whether the target is occupied
-                    for delta in 1..man_dist {
-                        let delta = if neg { -delta } else { delta };
-                        let pos = if vertical {
-                            (start.0, (start.1 as i8 + delta) as usize)
-                        } else {
-                            ((start.0 as i8 + delta) as usize, start.1)
-                        };
+        if moving.ty() != PieceTy::King && !in_check {
+            let is_ep = moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass;
 
-                        if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
-                            return false;
-                        }
-                    }
-                } else {
-                    // bishop-like movement
-                    let x_change = end.0 as i8 - start.0 as i8;
-                    let y_change = end.1 as i8 - start.1 as i8;
+            if !is_ep {
+                let on_ray = (RANK_MASKS[king_sq as usize]
+                    | FILE_MASKS[king_sq as usize]
+                    | DIAGONAL_MASKS[king_sq as usize]
+                    | ANTI_DIAGONAL_MASKS[king_sq as usize])
+                    & bit(sq(m.from))
+                    != 0;
 
-                    if x_change.abs() != y_change.abs() {
-                        return false;
-                    }
+                if !on_ray {
+                    return true;
+                }
 
-                    // one less as we don't care whether the target is occupied
-                    for delta in 1..(x_change.abs()) {
-                        let dx = delta * x_change.signum();
-                        let dy = delta * y_change.signum();
+                let occ_without = self.board.all & !bit(sq(m.from));
+                let diag_pinners =
+                    self.board.pieces[ec][BB_BISHOP] | self.board.pieces[ec][BB_QUEEN];
+                let straight_pinners =
+                    self.board.pieces[ec][BB_ROOK] | self.board.pieces[ec][BB_QUEEN];
 
-                        let pos = ((start.0 as i8 + dx) as usize, (start.1 as i8 + dy) as usize);
+                let pinned_diag = bishop_attacks(king_sq, occ_without) & diag_pinners != 0;
+                let pinned_straight = rook_attacks(king_sq, occ_without) & straight_pinners != 0;
 
-                        if pos.0 >= 8 || pos.1 >= 8 || self.occupied(pos) {
-                            return false;
-                        }
-                    }
+                if !pinned_diag && !pinned_straight {
+                    return true;
                 }
             }
         }
 
-        let mut temp_board = self.board;
-        self.move_piece_board(m, &mut temp_board);
-
-        let king_pos = if piece.ty() == PieceTy::King {
-            m.to
+        let mut bb = self.board.clone();
+        self.apply_move_board(&mut bb, m, moving);
+        let final_king_sq = if moving.ty() == PieceTy::King {
+            bb.pieces[c][BB_KING].trailing_zeros()
         } else {
-            self.get_piece_pos(Square::piece(PieceTy::King, piece.color()))
-                .unwrap()
+            king_sq
+        };
+        !Self::under_threat_pos(final_king_sq, moving.color().other(), &bb)
+    }
+
+    fn move_is_legal(&self, m: Move) -> bool {
+        let in_check = self.check(self.get(m.from).color());
+        self.move_is_legal_fast(m, in_check)
+    }
+
+    fn is_valid_pawn(&self, m: Move, color: Color) -> bool {
+        let (push_dir, start_y, promo_y) = match color {
+            Color::White => (1, 1, 7),
+            Color::Black => (-1, 6, 0),
         };
 
-        !Self::under_threat_pos_board(&temp_board, king_pos, piece.color().other())
+        let dy = m.to.1 as i32 - m.from.1 as i32;
+        let dx = m.to.0 as i32 - m.from.0 as i32;
+
+        if (m.to.1 == promo_y) != m.promotion.is_some() {
+            return false;
+        }
+        if let Some(p) = m.promotion {
+            if matches!(p, PieceTy::Pawn | PieceTy::King) {
+                return false;
+            }
+        }
+
+        if dy != push_dir && dy != push_dir * 2 {
+            return false;
+        }
+
+        match dx {
+            0 => {
+                let mid = (m.from.0, (m.from.1 as i32 + push_dir) as usize);
+                if self.board.all & bit(sq(mid)) != 0 {
+                    return false;
+                }
+                if dy == push_dir * 2 {
+                    if m.from.1 != start_y {
+                        return false;
+                    }
+                    if self.board.all & bit(sq(m.to)) != 0 {
+                        return false;
+                    }
+                }
+            }
+            1 | -1 => {
+                if dy != push_dir {
+                    return false;
+                }
+                let en_pass = Some(m.to) == self.enpass;
+                if !en_pass && !self.occupied(m.to) {
+                    return false;
+                }
+                if en_pass && !self.occupied(m.to) {
+                    let victim = self.get((m.to.0, m.from.1));
+                    if victim.is_empty() || victim.color() == color {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+
+        true
+    }
+
+    fn is_valid_king(&self, m: Move, color: Color, c: usize) -> bool {
+        if m.promotion.is_some() {
+            return false;
+        }
+
+        let dx = m.to.0 as i32 - m.from.0 as i32;
+        let dy = m.to.1 as i32 - m.from.1 as i32;
+
+        if dx.abs() == 2 && dy == 0 {
+            let queenside = dx < 0;
+            let can_castle = if queenside {
+                self.castleable[c].0
+            } else {
+                self.castleable[c].1
+            };
+            if !can_castle {
+                return false;
+            }
+
+            if self.check(color) {
+                return false;
+            }
+
+            let rank = m.from.1;
+
+            let (empty_lo, empty_hi) = if queenside { (1, 3) } else { (5, 6) };
+            for x in empty_lo..=empty_hi {
+                if self.board.all & (1u64 << sq((x, rank))) != 0 {
+                    return false;
+                }
+            }
+
+            let pass_x = if queenside { 3 } else { 5 };
+            if Self::under_threat_pos(sq((pass_x, rank)), color.other(), &self.board) {
+                return false;
+            }
+
+            true
+        } else {
+            KING_ATTACKS[sq(m.from) as usize] & (1u64 << sq(m.to)) != 0
+        }
     }
 
     pub fn check(&self, c: Color) -> bool {
@@ -795,158 +1017,85 @@ impl Game {
     }
 
     pub fn get_all_pieces(&self) -> impl Iterator<Item = (Square, Pos)> {
-        self.board
-            .as_flattened()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| (!p.is_empty()).then(|| (*p, (i % 8, i / 8))))
+        self.get_all_pieces_ty(PieceTy::Pawn)
+            .chain(self.get_all_pieces_ty(PieceTy::Bishop))
+            .chain(self.get_all_pieces_ty(PieceTy::Knight))
+            .chain(self.get_all_pieces_ty(PieceTy::Rook))
+            .chain(self.get_all_pieces_ty(PieceTy::Queen))
+            .chain(self.get_all_pieces_ty(PieceTy::King))
     }
 
-    fn under_threat_pos_board(board: &Board, pos: Pos, other: Color) -> bool {
-        let get = |p: Pos| board[p.1][p.0];
+    pub fn get_all_pieces_color(&self, c: Color) -> impl Iterator<Item = (Square, Pos)> {
+        self.get_all_pieces_ty_color(PieceTy::Pawn, c)
+            .chain(self.get_all_pieces_ty_color(PieceTy::Bishop, c))
+            .chain(self.get_all_pieces_ty_color(PieceTy::Knight, c))
+            .chain(self.get_all_pieces_ty_color(PieceTy::Rook, c))
+            .chain(self.get_all_pieces_ty_color(PieceTy::Queen, c))
+            .chain(self.get_all_pieces_ty_color(PieceTy::King, c))
+    }
 
-        // pawn
-        {
-            let y_dir = other.other().to_int();
-            let y = pos.1 as i64 + y_dir;
-            if y >= 0 && y <= 7 {
-                let check = |x: isize| {
-                    x >= 0
-                        && x <= 7
-                        && get((x as usize, y as usize)) == Square::piece(PieceTy::Pawn, other)
-                };
+    pub fn get_all_pieces_ty(&self, ty: PieceTy) -> impl Iterator<Item = (Square, Pos)> {
+        self.get_all_pieces_ty_color(ty, Color::White)
+            .chain(self.get_all_pieces_ty_color(ty, Color::Black))
+    }
 
-                if check(pos.0 as isize + 1) || check(pos.0 as isize - 1) {
-                    return true;
-                }
-            }
+    pub fn get_all_pieces_ty_color(
+        &self,
+        ty: PieceTy,
+        c: Color,
+    ) -> impl Iterator<Item = (Square, Pos)> {
+        let mut pieces = self.board.pieces[c.to_index()][ty.to_u8() as usize - 1];
+        std::iter::from_fn(move || {
+            (pieces != 0).then(|| {
+                let pos = pop_lsb(&mut pieces);
+                (Square::piece(ty, c), sq_to_pos(pos))
+            })
+        })
+    }
+
+    pub fn under_threat_pos(sq: u32, by: Color, board: &BitBoards) -> bool {
+        let c = by.to_index();
+
+        if PAWN_ATTACKS[1 - c][sq as usize] & board.pieces[c][BB_PAWN] != 0 {
+            return true;
         }
 
-        const KNIGHT_DELTAS: [(isize, isize); 8] = [
-            (2, 1),
-            (2, -1),
-            (-2, 1),
-            (-2, -1),
-            (1, 2),
-            (1, -2),
-            (-1, 2),
-            (-1, -2),
-        ];
-
-        for (dx, dy) in KNIGHT_DELTAS {
-            let nx = pos.0 as isize + dx;
-            let ny = pos.1 as isize + dy;
-            if nx < 0 || nx >= 8 || ny < 0 || ny >= 8 {
-                continue;
-            }
-            if let p = get((nx as usize, ny as usize))
-                && p != Square::EMPTY
-                && p.ty() == PieceTy::Knight
-                && p.color() == other
-            {
-                return true;
-            }
+        if KNIGHT_ATTACKS[sq as usize] & board.pieces[c][BB_KNIGHT] != 0 {
+            return true;
         }
 
-        let oob = |a: isize, x: isize| a + x < 0 || a + x >= 8;
-        // bishop
-        for dir in [(1, 1), (-1, 1), (-1, -1), (1, -1)] {
-            let mut pos = pos;
-            loop {
-                if oob(pos.0 as isize, dir.0) || oob(pos.1 as isize, dir.1) {
-                    break;
-                }
-
-                pos = (
-                    (pos.0 as isize + dir.0) as usize,
-                    (pos.1 as isize + dir.1) as usize,
-                );
-
-                if let p = get(pos)
-                    && p != Square::EMPTY
-                {
-                    if (p.ty() == PieceTy::Bishop || p.ty() == PieceTy::Queen) && p.color() == other
-                    {
-                        return true;
-                    }
-                    break;
-                }
-            }
+        if KING_ATTACKS[sq as usize] & board.pieces[c][BB_KING] != 0 {
+            return true;
         }
 
-        // rook
-        for dir in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let mut pos = pos;
-            loop {
-                if oob(pos.0 as isize, dir.0) || oob(pos.1 as isize, dir.1) {
-                    break;
-                }
-
-                pos = (
-                    (pos.0 as isize + dir.0) as usize,
-                    (pos.1 as isize + dir.1) as usize,
-                );
-
-                if let p = get(pos)
-                    && p != Square::EMPTY
-                {
-                    if (p.ty() == PieceTy::Rook || p.ty() == PieceTy::Queen) && p.color() == other {
-                        return true;
-                    }
-                    break;
-                }
-            }
+        let diag = bishop_attacks(sq, board.all);
+        if diag & (board.pieces[c][BB_BISHOP] | board.pieces[c][BB_QUEEN]) != 0 {
+            return true;
         }
 
-        for delta in [
-            (1, 1),
-            (1, 0),
-            (1, -1),
-            (0, -1),
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, 1),
-        ] {
-            let p = (pos.0 as isize + delta.0, pos.1 as isize + delta.1);
-            if p.0 < 0 || p.0 > 7 || p.1 < 0 || p.1 > 7 {
-                continue;
-            }
-            let p = (p.0 as usize, p.1 as usize);
-            if let piece = get(p)
-                && !piece.is_empty()
-                && piece.color() == other
-                && piece.ty() == PieceTy::King
-            {
-                return true;
-            }
+        let straight = rook_attacks(sq, board.all);
+        if straight & (board.pieces[c][BB_ROOK] | board.pieces[c][BB_QUEEN]) != 0 {
+            return true;
         }
 
         false
     }
 
     #[inline]
-    pub fn under_threat_pos(&self, pos: Pos, by: Color) -> bool {
-        Self::under_threat_pos_board(&self.board, pos, by)
-    }
-
-    #[inline]
     pub fn under_threat(&self, p: Square) -> bool {
-        let Some(pos) = self.get_piece_pos(p) else {
-            return false;
-        };
+        let pos = sq(self.get_piece_pos(p));
 
-        self.under_threat_pos(pos, p.color().other())
+        Self::under_threat_pos(pos, p.color().other(), &self.board)
     }
 
     pub fn checkmate(&self, c: Color) -> bool {
-        self.check(c) && self.get_all_moves(c).find(|_| true).is_none() && !self.lose_on_repeat()
+        self.check(c) && !self.has_any_legal_move(c) && !self.lose_on_repeat()
     }
 
     pub fn stalemate(&self, c: Color) -> bool {
         let not_in_check = !self.check(c);
         let repeat = self.lose_on_repeat();
-        let no_moves = self.get_all_moves(c).find(|_| true).is_none();
+        let no_moves = !self.has_any_legal_move(c);
 
         (not_in_check && no_moves) || repeat
     }
@@ -957,7 +1106,6 @@ impl Game {
             return true;
         }
 
-        // check for en passant
         if let p = self.get(m.from)
             && p.ty() == PieceTy::Pawn
             && m.from.0 != m.to.0
@@ -968,119 +1116,320 @@ impl Game {
         false
     }
 
-    pub fn get_all_moves(&self, c: Color) -> impl Iterator<Item = Move> {
-        self.get_all_pseudo_moves(c).filter(|m| self.is_valid(*m))
+    pub fn get_all_moves(&self, c: Color) -> Vec<Move> {
+        let in_check = self.check(c);
+        self.get_all_pseudo_moves(c)
+            .into_iter()
+            .filter(|m| self.move_is_legal_fast(*m, in_check))
+            .collect()
     }
 
-    pub fn get_all_pseudo_moves(&self, c: Color) -> impl Iterator<Item = Move> {
-        self.board
-            .iter()
-            .enumerate()
-            .flat_map(|(y, row)| row.iter().enumerate().map(move |(x, p)| ((x, y), p)))
-            .filter_map(|(pos, p)| (!p.is_empty()).then(|| (pos, p)))
-            .filter(move |(_, p)| p.color() == c)
-            .map(|(pos, piece)| ((pos.0 as isize, pos.1 as isize), piece))
-            .flat_map(move |(pos, piece)| {
-                match piece.ty() {
-                    PieceTy::Pawn => {
-                        let pawn_move_dir = c.to_int() as isize;
-                        let y = pos.1 + pawn_move_dir;
+    pub fn get_all_pseudo_moves(&self, color: Color) -> Vec<Move> {
+        // technically, max is 218. but this is good enough as vec can resize.
+        // we use a vec instead of an array because returning an array is expensive. we COULD use an out parameter
+        // which might be a good idea to prevent the expensiveness of heap allocation
+        // TODO
+        let mut moves = Vec::with_capacity(64);
+        let c = color.to_index();
+        let own = self.board.color[c];
+        let all = self.board.all;
+        let enemy = self.board.color[1 - c];
 
-                        [
-                            (pos.0, y, None),
-                            (pos.0, y, Some(PieceTy::Queen)),
-                            (pos.0, y, Some(PieceTy::Rook)),
-                            (pos.0, y, Some(PieceTy::Knight)),
-                            (pos.0, y, Some(PieceTy::Bishop)),
-                            (pos.0 - 1, y, Some(PieceTy::Queen)),
-                            (pos.0 - 1, y, Some(PieceTy::Rook)),
-                            (pos.0 - 1, y, Some(PieceTy::Knight)),
-                            (pos.0 - 1, y, Some(PieceTy::Bishop)),
-                            (pos.0 + 1, y, Some(PieceTy::Queen)),
-                            (pos.0 + 1, y, Some(PieceTy::Rook)),
-                            (pos.0 + 1, y, Some(PieceTy::Knight)),
-                            (pos.0 + 1, y, Some(PieceTy::Bishop)),
-                            (pos.0, y + pawn_move_dir, None), // move 2 tiles
-                            (pos.0 - 1, y, None),
-                            (pos.0 + 1, y, None),
-                        ]
-                        .into_iter()
-                        .filter(|(_, y, p)| p.is_some() ^ (*y != 0 && *y != 7))
-                        .collect()
-                    }
-                    PieceTy::King => {
-                        vec![
-                            (pos.0, pos.1 + 1, None),
-                            (pos.0, pos.1 - 1, None),
-                            (pos.0 + 1, pos.1, None),
-                            (pos.0 - 1, pos.1, None),
-                            (pos.0 + 1, pos.1 + 1, None),
-                            (pos.0 - 1, pos.1 + 1, None),
-                            (pos.0 + 1, pos.1 - 1, None),
-                            (pos.0 - 1, pos.1 - 1, None),
-                            (pos.0 + 2, pos.1, None),
-                            (pos.0 - 2, pos.1, None),
-                        ]
-                    }
-                    PieceTy::Bishop => (0..8)
-                        .flat_map(|delta| {
-                            [
-                                (delta, delta + pos.1 - pos.0, None),
-                                (pos.1 + pos.0 - delta, delta, None),
-                            ]
-                        })
-                        .collect(),
-                    PieceTy::Rook => (0..8)
-                        .flat_map(|delta| [(delta, pos.1, None), (pos.0, delta, None)])
-                        .collect(),
-                    PieceTy::Queen => (0..8)
-                        .flat_map(|delta| {
-                            [
-                                (delta, delta + pos.1 - pos.0, None),
-                                (pos.1 + pos.0 - delta, delta, None),
-                                (delta, pos.1, None),
-                                (pos.0, delta, None),
-                            ]
-                        })
-                        .collect(),
-                    PieceTy::Knight => vec![
-                        (pos.0 - 1, pos.1 + 2, None),
-                        (pos.0 + 1, pos.1 + 2, None),
-                        (pos.0 + 2, pos.1 + 1, None),
-                        (pos.0 + 2, pos.1 - 1, None),
-                        (pos.0 + 1, pos.1 - 2, None),
-                        (pos.0 - 1, pos.1 - 2, None),
-                        (pos.0 - 2, pos.1 - 1, None),
-                        (pos.0 - 2, pos.1 + 1, None),
-                    ],
-                }
-                .into_iter()
-                .map(move |d| (pos, (d.0, d.1), d.2))
-                .collect::<Vec<_>>()
-            })
-            .filter_map(|m| {
-                let v = |n| (n >= 0 && n <= 7).then_some(n as usize);
+        self.gen_pawn_moves(color, c, all, enemy, &mut moves);
+        self.gen_knight_moves(c, own, &mut moves);
+        self.gen_bishop_moves(c, own, all, &mut moves);
+        self.gen_rook_moves(c, own, all, &mut moves);
+        self.gen_queen_moves(c, own, all, &mut moves);
+        self.gen_king_moves(color, c, own, all, &mut moves);
 
-                Some(((v(m.0.0)?, v(m.0.1)?), (v(m.1.0)?, v(m.1.1)?), m.2))
-            })
-            .map(|m| Move {
-                from: m.0,
-                to: m.1,
-                promotion: m.2,
-            })
+        moves
     }
 
-    pub fn get_piece_pos(&self, piece: Square) -> Option<Pos> {
-        self.board.iter().enumerate().find_map(|(y, r)| {
-            r.iter()
-                .enumerate()
-                .find_map(|(x, p)| (*p == piece).then_some((x, y)))
-        })
+    fn gen_pawn_moves(&self, color: Color, c: usize, all: BB, enemy: BB, moves: &mut Vec<Move>) {
+        let pawns = self.board.pieces[c][BB_PAWN];
+        let free = !all;
+
+        if pawns == 0 {
+            return;
+        }
+
+        let (push, pre_promo, mid) = if color == Color::White {
+            (8i32, RANK_7, RANK_3)
+        } else {
+            (-8i32, RANK_2, RANK_6)
+        };
+
+        let (left_dir, right_dir) = if color == Color::White {
+            (7i32, 9i32)
+        } else {
+            (-9i32, -7i32)
+        };
+
+        let non_promo = pawns & !pre_promo;
+        let promo_pawns = pawns & pre_promo;
+
+        let single_push = shift(non_promo, push) & free;
+        let mut tmp = single_push;
+        while tmp != 0 {
+            let to = pop_lsb(&mut tmp);
+            let from = (to as i32 - push) as u32;
+            moves.push(Move {
+                from: sq_to_pos(from),
+                to: sq_to_pos(to),
+                promotion: None,
+            });
+        }
+
+        let mut double_push = shift(single_push & mid, push) & free;
+        while double_push != 0 {
+            let to = pop_lsb(&mut double_push);
+            let from = (to as i32 - push * 2) as u32;
+            moves.push(Move {
+                from: sq_to_pos(from),
+                to: sq_to_pos(to),
+                promotion: None,
+            });
+        }
+
+        let mut left_cap = shift(non_promo & !FILE_A, left_dir) & enemy;
+        while left_cap != 0 {
+            let to = pop_lsb(&mut left_cap);
+            let from = (to as i32 - left_dir) as u32;
+            moves.push(Move {
+                from: sq_to_pos(from),
+                to: sq_to_pos(to),
+                promotion: None,
+            });
+        }
+
+        let mut right_cap = shift(non_promo & !FILE_H, right_dir) & enemy;
+        while right_cap != 0 {
+            let to = pop_lsb(&mut right_cap);
+            let from = (to as i32 - right_dir) as u32;
+            moves.push(Move {
+                from: sq_to_pos(from),
+                to: sq_to_pos(to),
+                promotion: None,
+            });
+        }
+
+        const PROMOS: [PieceTy; 4] = [
+            PieceTy::Queen,
+            PieceTy::Rook,
+            PieceTy::Bishop,
+            PieceTy::Knight,
+        ];
+
+        let mut straight_promo = shift(promo_pawns, push) & free;
+        while straight_promo != 0 {
+            let to = pop_lsb(&mut straight_promo);
+            let from = sq_to_pos((to as i32 - push) as u32);
+            let to = sq_to_pos(to);
+            for p in PROMOS {
+                moves.push(Move {
+                    from,
+                    to,
+                    promotion: Some(p),
+                });
+            }
+        }
+
+        let mut left_cap_promo = shift(promo_pawns & !FILE_A, left_dir) & enemy;
+        while left_cap_promo != 0 {
+            let to = pop_lsb(&mut left_cap_promo);
+            let from = sq_to_pos((to as i32 - left_dir) as u32);
+            let to = sq_to_pos(to);
+            for p in PROMOS {
+                moves.push(Move {
+                    from,
+                    to,
+                    promotion: Some(p),
+                });
+            }
+        }
+
+        let mut right_cap_promo = shift(promo_pawns & !FILE_H, right_dir) & enemy;
+        while right_cap_promo != 0 {
+            let to = pop_lsb(&mut right_cap_promo);
+            let from = sq_to_pos((to as i32 - right_dir) as u32);
+            let to = sq_to_pos(to);
+            for p in PROMOS {
+                moves.push(Move {
+                    from,
+                    to,
+                    promotion: Some(p),
+                });
+            }
+        }
+
+        if let Some(ep) = self.enpass {
+            let s = sq(ep);
+            let mut attackers = PAWN_ATTACKS[1 - c][s as usize] & pawns;
+            while attackers != 0 {
+                let from = pop_lsb(&mut attackers);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to: ep,
+                    promotion: None,
+                });
+            }
+        }
+    }
+
+    fn gen_knight_moves(&self, c: usize, own: BB, moves: &mut Vec<Move>) {
+        let mut pieces = self.board.pieces[c][BB_KNIGHT];
+        while pieces != 0 {
+            let from = pop_lsb(&mut pieces);
+            let mut targets = KNIGHT_ATTACKS[from as usize] & !own;
+            while targets != 0 {
+                let to = pop_lsb(&mut targets);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to: sq_to_pos(to),
+                    promotion: None,
+                });
+            }
+        }
+    }
+
+    fn gen_bishop_moves(&self, c: usize, own: BB, occ: BB, moves: &mut Vec<Move>) {
+        let mut pieces = self.board.pieces[c][BB_BISHOP];
+        while pieces != 0 {
+            let from = pop_lsb(&mut pieces);
+            let mut targets = bishop_attacks(from, occ) & !own;
+            while targets != 0 {
+                let to = pop_lsb(&mut targets);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to: sq_to_pos(to),
+                    promotion: None,
+                });
+            }
+        }
+    }
+
+    fn gen_rook_moves(&self, c: usize, own: BB, occ: BB, moves: &mut Vec<Move>) {
+        let mut pieces = self.board.pieces[c][BB_ROOK];
+        while pieces != 0 {
+            let from = pop_lsb(&mut pieces);
+            let mut targets = rook_attacks(from, occ) & !own;
+            while targets != 0 {
+                let to = pop_lsb(&mut targets);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to: sq_to_pos(to),
+                    promotion: None,
+                });
+            }
+        }
+    }
+
+    fn gen_queen_moves(&self, c: usize, own: BB, all: BB, moves: &mut Vec<Move>) {
+        let mut pieces = self.board.pieces[c][BB_QUEEN];
+        while pieces != 0 {
+            let from = pop_lsb(&mut pieces);
+            let mut targets = (bishop_attacks(from, all) | rook_attacks(from, all)) & !own;
+            while targets != 0 {
+                let to = pop_lsb(&mut targets);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to: sq_to_pos(to),
+                    promotion: None,
+                });
+            }
+        }
+    }
+
+    fn gen_king_moves(&self, color: Color, c: usize, own: BB, all: BB, moves: &mut Vec<Move>) {
+        let king_bb = self.board.pieces[c][BB_KING];
+        if king_bb == 0 {
+            return;
+        }
+        let from = king_bb.trailing_zeros();
+
+        let mut targets = KING_ATTACKS[from as usize] & !own;
+        while targets != 0 {
+            let to = pop_lsb(&mut targets);
+            moves.push(Move {
+                from: sq_to_pos(from),
+                to: sq_to_pos(to),
+                promotion: None,
+            });
+        }
+
+        let back_rank = color.start();
+        let (can_queenside, can_kingside) = self.castleable[c];
+
+        if can_kingside {
+            let between = (1 << (back_rank * 8 + 5)) | (1 << (back_rank * 8 + 6));
+            if all & between == 0 {
+                let to = sq_to_pos((back_rank * 8 + 6) as u32);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to,
+                    promotion: None,
+                });
+            }
+        }
+
+        if can_queenside {
+            let between = (1 << (back_rank * 8 + 1))
+                | (1 << (back_rank * 8 + 2))
+                | (1 << (back_rank * 8 + 3));
+            if all & between == 0 {
+                let to = sq_to_pos((back_rank * 8 + 2) as u32);
+                moves.push(Move {
+                    from: sq_to_pos(from),
+                    to,
+                    promotion: None,
+                });
+            }
+        }
+    }
+
+    pub fn has_any_legal_move(&self, color: Color) -> bool {
+        let in_check = self.check(color);
+        self.get_all_pseudo_moves(color)
+            .into_iter()
+            .any(|m| self.move_is_legal_fast(m, in_check))
+    }
+
+    #[inline]
+    pub fn get_piece_pos(&self, piece: Square) -> Pos {
+        let s = self.board.pieces[piece.color().to_index()][piece.ty().to_u8() as usize - 1]
+            .trailing_zeros();
+        sq_to_pos(s)
     }
 
     #[inline]
     pub fn get(&self, p: Pos) -> Square {
-        self.board[p.1][p.0]
+        self.board.get(p)
+    }
+
+    #[inline]
+    pub fn piece_count(&self, s: Square) -> u32 {
+        self.board.pieces[s.color().to_index()][s.ty() as usize - 1].count_ones()
+    }
+
+    pub fn doubled_pawns_check(&self, color: Color) -> i64 {
+        let board = self.board.pieces[color.to_index()][BB_PAWN];
+        (0..8)
+            .map(|r| {
+                let rank = FILE_A << r;
+
+                let pawns = (board & rank).count_ones();
+
+                if pawns > 1 { pawns as i64 - 1 } else { 0 }
+            })
+            .sum()
+    }
+
+    pub fn pawn_endgame(&self) -> bool {
+        (self.board.pieces[0][BB_PAWN]
+            | self.board.pieces[1][BB_PAWN]
+            | self.board.pieces[0][BB_KING]
+            | self.board.pieces[1][BB_KING])
+            == self.board.all
     }
 }
 
@@ -1089,3 +1438,133 @@ impl Default for Game {
         Self::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
     }
 }
+
+pub static PAWN_ATTACKS: LazyLock<[[BB; 64]; 2]> = LazyLock::new(|| {
+    let mut attacks = [[0u64; 64]; 2];
+    for sq in 0..64u32 {
+        let b = 1u64 << sq;
+
+        attacks[0][sq as usize] = ((b & !FILE_A) << 7) | ((b & !FILE_H) << 9);
+        attacks[1][sq as usize] = ((b & !FILE_A) >> 9) | ((b & !FILE_H) >> 7);
+    }
+    attacks
+});
+
+static KNIGHT_ATTACKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
+    std::array::from_fn(|sq| {
+        let b = bit(sq as u32);
+        let mut att = 0u64;
+        att |= (b << 17) & !FILE_A;
+        att |= (b << 15) & !FILE_H;
+        att |= (b << 10) & !(FILE_A | FILE_B);
+        att |= (b << 6) & !(FILE_G | FILE_H);
+        att |= (b >> 17) & !FILE_H;
+        att |= (b >> 15) & !FILE_A;
+        att |= (b >> 10) & !(FILE_G | FILE_H);
+        att |= (b >> 6) & !(FILE_A | FILE_B);
+        att
+    })
+});
+
+pub static KING_ATTACKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
+    std::array::from_fn(|sq| {
+        let b = 1u64 << sq;
+        let mut att = 0u64;
+
+        att |= b << 8;
+        att |= (b & !FILE_H) << 9;
+        att |= (b & !FILE_H) << 1;
+        att |= (b & !FILE_H) >> 7;
+        att |= b >> 8;
+        att |= (b & !FILE_A) >> 9;
+        att |= (b & !FILE_A) >> 1;
+        att |= (b & !FILE_A) << 7;
+
+        att
+    })
+});
+
+static RANK_MASKS: LazyLock<[BB; 64]> =
+    LazyLock::new(|| std::array::from_fn(|sq| 0xFFu64 << (sq & 56)));
+
+static FILE_MASKS: LazyLock<[BB; 64]> =
+    LazyLock::new(|| std::array::from_fn(|sq| FILE_A << (sq % 8)));
+
+// top right -> bottom left
+static DIAGONAL_MASKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
+    std::array::from_fn(|sq| {
+        let d = (sq / 8) as i32 - (sq % 8) as i32;
+        let mut mask = 0u64;
+        for s in 0..64usize {
+            if (s / 8) as i32 - (s % 8) as i32 == d {
+                mask |= 1u64 << s;
+            }
+        }
+        mask
+    })
+});
+
+// top left -> bottom right
+static ANTI_DIAGONAL_MASKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
+    std::array::from_fn(|sq| {
+        let d = (sq / 8) as i32 + (sq % 8) as i32;
+        let mut mask = 0u64;
+        for s in 0..64usize {
+            if (s / 8) as i32 + (s % 8) as i32 == d {
+                mask |= 1u64 << s;
+            }
+        }
+        mask
+    })
+});
+
+#[inline]
+fn hyperbola_quintessence(sq: u32, all: BB, mask: BB) -> BB {
+    let o = all & mask;
+    let s = bit(sq);
+
+    let forward = o.wrapping_sub(s.wrapping_mul(2));
+
+    let ro = o.reverse_bits();
+    let rs = bit(63 - sq);
+    let backward = (ro.wrapping_sub(rs.wrapping_mul(2))).reverse_bits();
+
+    (forward ^ backward) & mask
+}
+
+#[inline]
+pub fn bishop_attacks(sq: u32, all: BB) -> BB {
+    hyperbola_quintessence(sq, all, DIAGONAL_MASKS[sq as usize])
+        | hyperbola_quintessence(sq, all, ANTI_DIAGONAL_MASKS[sq as usize])
+}
+
+#[inline]
+pub fn rook_attacks(sq: u32, all: BB) -> BB {
+    hyperbola_quintessence(sq, all, RANK_MASKS[sq as usize])
+        | hyperbola_quintessence(sq, all, FILE_MASKS[sq as usize])
+}
+
+const FILE_A: u64 = 0x0101010101010101;
+const FILE_B: u64 = FILE_A << 1;
+#[allow(unused)]
+const FILE_C: u64 = FILE_A << 2;
+#[allow(unused)]
+const FILE_D: u64 = FILE_A << 3;
+#[allow(unused)]
+const FILE_E: u64 = FILE_A << 4;
+#[allow(unused)]
+const FILE_F: u64 = FILE_A << 5;
+const FILE_G: u64 = FILE_A << 6;
+const FILE_H: u64 = FILE_A << 7;
+
+const RANK_1: u64 = 0x00000000000000FF;
+const RANK_2: u64 = RANK_1 << (8 * 1);
+const RANK_3: u64 = RANK_1 << (8 * 2);
+#[allow(unused)]
+const RANK_4: u64 = RANK_1 << (8 * 3);
+#[allow(unused)]
+const RANK_5: u64 = RANK_1 << (8 * 4);
+const RANK_6: u64 = RANK_1 << (8 * 5);
+const RANK_7: u64 = RANK_1 << (8 * 6);
+#[allow(unused)]
+const RANK_8: u64 = RANK_1 << (8 * 7);

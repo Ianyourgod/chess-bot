@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dashmap = "6.2.1"
+hashbrown = "0.17.1"
 nohash-hasher = "0.2.0"
 rand = "0.10.1"
 ratatui = "0.30.1"

@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
-use nohash_hasher::BuildNoHashHasher;
-
 use crate::game::{Color, Game, Move, PieceTy, Pos, Square};
+
+mod cache;
+#[allow(unused)]
+use cache::{Cache, CacheBound, CacheTrait, DashCache};
 
 const CHECKMATE: i64 = i64::MAX;
 const DRAW: i64 = -200;
@@ -19,23 +20,21 @@ const PIECE_POS_MULT: i64 = 1;
 #[allow(unused)]
 const MOBILITY_MULT: i64 = 1;
 const BISHOP_PAIRS: i64 = 5;
+const DOUBLED_PAWNS: i64 = -3;
+const TO_MOVE_BONUS: i64 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CacheBound {
-    Exact,
-    Lower,
-    Upper,
-}
+const MAX_EXTENSIONS: u16 = 16;
+const NULL_MOVE_REDUX: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CalcConstraint {
     Time(Duration),
-    Depth(u32),
+    Depth(u16),
 }
 
 #[derive(Debug, Clone)]
 pub struct Engine {
-    cache: DashMap<u64, (i64, Move, u32, CacheBound), BuildNoHashHasher<u64>>,
+    cache: DashCache,
     start_time: Instant,
     constraint: CalcConstraint,
 }
@@ -43,7 +42,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(constraint: CalcConstraint) -> Self {
         Self {
-            cache: DashMap::default(),
+            cache: DashCache::cache_new(),
             start_time: Instant::now(),
             constraint,
         }
@@ -54,67 +53,106 @@ impl Engine {
         self.start_time.elapsed()
     }
 
-    pub fn best_move(&mut self, game: &mut Game) -> (i64, Move, u32) {
+    pub fn best_move(&mut self, game: &mut Game) -> (i64, Move, u16) {
         let mut depth = 1;
 
-        let mut best = self.eval_rec(game, 1, -CHECKMATE, CHECKMATE, 0);
+        let mut best = self.eval_rec_base(game, depth);
 
         self.start_time = std::time::Instant::now();
+
         loop {
-            /*
+            // TODO: figure out a way to only log when we're not doing ratatui stuff
             println!(
                 "depth {} at {}ms",
                 depth,
                 self.start_time.elapsed().as_millis()
             );
-            */
 
-            if best.0 == CHECKMATE || self.timed_out(depth) {
+            // -50 so that our move thing (prioritize late/early checkmates) still works with this
+            if best.0 >= (CHECKMATE - 50) || self.timed_out(depth) {
                 break (best.0, best.1, depth);
             }
             depth += 1;
 
-            let result = self.eval_rec(game, depth, -CHECKMATE, CHECKMATE, 0);
+            let s = self.eval_rec_base(game, depth);
 
-            if !self.timed_out(depth) {
-                best = result;
-            } else {
-                //eprintln!("timed out at {}ms", self.start_time.elapsed().as_millis());
+            if self.timed_out(depth) {
                 break (best.0, best.1, depth - 1);
             }
 
-            if best.1 == BASE_MOVE {
-                panic!("{:?} Best move is base", best);
-            }
+            best = s;
+
+            assert_ne!(best.1, BASE_MOVE)
         }
     }
 
-    fn timed_out(&self, depth: u32) -> bool {
+    fn timed_out(&self, depth: u16) -> bool {
         match self.constraint {
             CalcConstraint::Time(max) => self.start_time.elapsed() >= max,
             CalcConstraint::Depth(d) => depth > d,
         }
     }
 
-    fn eval_rec(
-        &self,
-        game: &mut Game,
-        depth: u32,
-        mut alpha: i64,
-        mut beta: i64,
-        moves: usize,
-    ) -> (i64, Move) {
+    fn extension_depth(game: &Game, depth: u16, m: Move, extensions_left: u16) -> u16 {
+        if depth <= 3
+            && extensions_left > 0
+            && (game.check(game.get_to_move()) || m.promotion.is_some())
+        {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn eval_rec_base(&mut self, game: &mut Game, depth: u16) -> (i64, Move) {
+        let mut best = (i64::MIN, BASE_MOVE);
+        let p_moves = game.get_all_moves(game.get_to_move());
+
         if self.timed_out(depth) {
             return (0, BASE_MOVE);
         }
 
+        let mut scored: Vec<(i64, Move)> = p_moves
+            .into_iter()
+            .map(|m| (self.move_order_score(game, m), m))
+            .collect();
+        scored.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
+
+        for (_, m) in scored {
+            game.move_piece(m);
+            let score = -self.eval_rec(game, depth - 1, -CHECKMATE, CHECKMATE, 0, MAX_EXTENSIONS);
+            game.undo_move();
+
+            if self.timed_out(depth) {
+                return best;
+            }
+
+            best = if best.0 >= score { best } else { (score, m) };
+        }
+
+        best
+    }
+
+    fn eval_rec(
+        &mut self,
+        game: &mut Game,
+        depth: u16,
+        mut alpha: i64,
+        mut beta: i64,
+        moves: usize,
+        extensions_left: u16,
+    ) -> i64 {
+        if self.timed_out(depth) {
+            return 0;
+        }
+
         if !game.has_been_played(game)
-            && let Some(entry) = self.cache.get(&game.get_hash())
-            && entry.2 >= depth
+            && let Some(entry) = self.cache.cache_get(game.get_hash())
+            && entry.1 >= depth
         {
-            match entry.3 {
+            match entry.2 {
                 CacheBound::Exact => {
-                    return (entry.0, entry.1);
+                    return entry.0;
                 }
                 CacheBound::Lower => {
                     alpha = alpha.max(entry.0);
@@ -125,68 +163,87 @@ impl Engine {
             }
 
             if alpha >= beta {
-                return (entry.0, entry.1);
+                return entry.0;
             }
         }
 
         if game.checkmate(game.get_to_move()) {
-            return (-CHECKMATE, BASE_MOVE);
+            return -CHECKMATE;
         }
         if game.stalemate(game.get_to_move()) || game.lose_on_repeat() {
-            return (DRAW, BASE_MOVE);
+            return DRAW;
         }
 
         if depth == 0 {
-            return (self.quiescence(game, alpha, beta, moves), BASE_MOVE);
+            return self.quiescence(game, alpha, beta, moves);
+        }
+
+        let nm_redux = NULL_MOVE_REDUX;
+        if depth >= nm_redux && !game.pawn_endgame() && !game.check(game.get_to_move()) {
+            game.make_null_move();
+            let score = -self.eval_rec(game, depth - nm_redux, -beta, -(beta - 1), moves, 0);
+            game.undo_move();
+            if score >= beta {
+                return score;
+            }
         }
 
         let original_alpha = alpha;
 
-        let mut best: Option<(i64, Move)> = None;
-        let p_moves = game.get_all_moves(game.get_to_move()).collect::<Vec<_>>();
+        let mut best = -i64::MAX;
+        let mut p_moves = game.get_all_moves(game.get_to_move());
 
-        let mut scored: Vec<_> = p_moves
-            .into_iter()
-            .map(|m| (self.move_order_score(game, m), m))
-            .collect();
+        p_moves.sort_unstable_by(|a, b| {
+            self.move_order_score(game, *b)
+                .cmp(&self.move_order_score(game, *a))
+        });
 
-        scored.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
-
-        for m in scored.into_iter().map(|(_, m)| m) {
+        for (i, m) in p_moves.into_iter().enumerate() {
             game.move_piece(m);
 
-            let score = -self.eval_rec(game, depth - 1, -beta, -alpha, moves + 1).0;
+            let extension = Self::extension_depth(game, depth, m, extensions_left);
+            let reduction = if i >= 3
+                && depth >= 3
+                && !game.is_capture(m)
+                && m.promotion.is_none()
+                && !game.check(game.get_to_move())
+            {
+                1
+            } else {
+                0
+            };
+
+            let score = -self.eval_rec(
+                game,
+                depth - 1 + extension - reduction,
+                -beta,
+                -alpha,
+                moves + 1,
+                extensions_left - extension,
+            );
+            game.undo_move();
 
             if self.timed_out(depth) {
-                game.undo_move();
-                return (0, BASE_MOVE);
+                return 0;
             }
 
             if score >= beta {
-                game.undo_move();
-                return (beta, m);
+                return beta;
             }
 
             alpha = alpha.max(score);
 
-            best = Some(match best {
-                Some(prev) if prev.0 >= score => prev,
-                _ => (score, m),
-            });
-
-            game.undo_move();
+            best = best.max(score);
         }
-        let best = best.unwrap(); // cannot be none - not checkmate or stalemate
 
         self.cache.insert(
             game.get_hash(),
             (
-                best.0,
-                best.1,
+                best,
                 depth,
-                if best.0 <= original_alpha {
+                if best <= original_alpha {
                     CacheBound::Upper
-                } else if best.0 >= beta {
+                } else if best >= beta {
                     CacheBound::Lower
                 } else {
                     CacheBound::Exact
@@ -196,7 +253,7 @@ impl Engine {
         best
     }
 
-    fn move_order_score(&self, game: &Game, m: Move) -> i64 {
+    fn move_order_score(&self, game: &mut Game, m: Move) -> i64 {
         let moving = game.get(m.from);
 
         if game.is_capture(m) {
@@ -214,13 +271,17 @@ impl Engine {
             return 9_000;
         }
 
+        let hash = game.hash_after_move(m);
+        if let Some(entry) = self.cache.cache_get(hash) {
+            return 1_000 - entry.0.clamp(-999, 999);
+        }
+
         0
     }
 
-    fn eval_base(&self, game: &Game, moves: usize) -> i64 {
+    fn eval_base(&mut self, game: &Game, moves: usize) -> i64 {
         if !game.has_been_played(game)
-            && let Some((score, _, _, CacheBound::Exact)) =
-                self.cache.get(&game.get_hash()).map(|v| *v.value())
+            && let Some((score, _, CacheBound::Exact)) = self.cache.cache_get(game.get_hash())
         {
             return score;
         }
@@ -229,45 +290,43 @@ impl Engine {
             return -CHECKMATE + moves as i64;
         }
 
-        let basic_piece_score =
-            Self::get_total_piece_score(game) * game.get_to_move().to_int() * PIECE_MULT;
+        let player = self.eval_base_color(game, game.get_to_move()) + TO_MOVE_BONUS;
+        let enemy = self.eval_base_color(game, game.get_to_move().other());
+
+        player - enemy
+    }
+
+    fn eval_base_color(&self, game: &Game, c: Color) -> i64 {
+        let basic_piece_score = Self::get_piece_score_color(game, c) * PIECE_MULT;
 
         let stage = Self::get_game_stage(game);
         let piece_pos_values = game
-            .get_all_pieces()
-            .map(|(p, pos)| self.piece_pos(stage, p, pos) * p.color().to_int())
+            .get_all_pieces_color(c)
+            .map(|(p, pos)| self.piece_pos(stage, p, pos))
             .sum::<i64>()
             * PIECE_POS_MULT;
 
         // TODO: reenable this once we make mobility better (cheaper)
-        let mobility = 0; /*(self.mobility(game, game.get_to_move())
-        - self.mobility(game, game.get_to_move().other()))
+        let mobility = 0; /*self.mobility(game, game.get_to_move())
          * MOBILITY_MULT;*/
 
-        let bishop_counts = game
-            .get_all_pieces()
-            .filter(|(p, _)| p.ty() == PieceTy::Bishop)
-            .fold([0i64; 2], |mut acc, (p, _)| {
-                acc[p.color().to_index()] += 1;
-                acc
-            });
+        let bishop_count = game.get_all_pieces_ty_color(PieceTy::Bishop, c).count();
 
-        let bishop_pairs =
-            ((bishop_counts[0] >= 2) as i64 - (bishop_counts[1] >= 2) as i64) * BISHOP_PAIRS;
+        let bishop_pairs = (bishop_count >= 2) as i64 * BISHOP_PAIRS;
 
-        // TODO: doubled pawns bad, backwards pawns bad
-        // perhaps rework this function to just be only get score for our color, then have a super function that subtracts them from us
+        let doubled_pawns = game.doubled_pawns_check(c) * DOUBLED_PAWNS;
 
-        let score = basic_piece_score + piece_pos_values + mobility + bishop_pairs;
+        // TODO: passed pawns
 
-        score
+        basic_piece_score + piece_pos_values + mobility + bishop_pairs + doubled_pawns
     }
 
     #[allow(unused)]
     fn mobility(&self, game: &Game, color: Color) -> i64 {
-        // TODO: check that we're not pinned, then use get_all_pseudo_moves
+        // TODO: use get_all_pseudo moves somehow
 
         game.get_all_moves(color)
+            .into_iter()
             .map(|m| game.get(m.from))
             .map(|p| match p.ty() {
                 PieceTy::Knight => 4,
@@ -290,7 +349,7 @@ impl Engine {
         game.get((m.to.0, m.from.1))
     }
 
-    fn quiescence(&self, game: &mut Game, mut alpha: i64, beta: i64, moves: usize) -> i64 {
+    fn quiescence(&mut self, game: &mut Game, mut alpha: i64, beta: i64, moves: usize) -> i64 {
         let stand_pat = self.eval_base(game, moves);
         if stand_pat >= beta {
             return beta;
@@ -303,9 +362,12 @@ impl Engine {
 
         alpha = alpha.max(stand_pat);
 
+        // TODO: maybe create get_all_captures
         let mut scored: Vec<_> = game
             .get_all_moves(game.get_to_move())
+            .into_iter()
             .filter(|&m| game.is_capture(m))
+            // TODO: this is probably too restrictive
             .filter(|&m| {
                 let victim = Self::piece_value_raw(Self::captured_square(game, m).ty());
                 let attacker = Self::piece_value_raw(game.get(m.from).ty());
@@ -341,18 +403,33 @@ impl Engine {
         alpha
     }
 
-    /// white is positive
-    fn get_total_piece_score(game: &Game) -> i64 {
-        game.get_all_pieces()
-            .map(|p| Self::piece_value(p.0))
+    fn get_piece_score_color(game: &Game, c: Color) -> i64 {
+        game.get_all_pieces_color(c)
+            .map(|p| Self::piece_value_raw(p.0.ty()))
             .fold(0, |a, b| a + b)
     }
 
-    /// white is positive
-    #[inline]
-    fn piece_value(p: Square) -> i64 {
-        p.color().to_int() * Self::piece_value_raw(p.ty())
+    /*
+    // this is somehow slower than the top one
+    fn get_total_piece_score(game: &Game) -> i64 {
+        let p = |t| {
+            (game.piece_count(Square::piece(t, Color::White))
+                - game.piece_count(Square::piece(t, Color::Black))) as i64
+        };
+
+        [
+            PieceTy::Pawn,
+            PieceTy::Bishop,
+            PieceTy::Knight,
+            PieceTy::Rook,
+            PieceTy::Queen,
+            PieceTy::King,
+        ]
+        .into_iter()
+        .map(|ty| Self::piece_value_raw(ty) * p(ty))
+        .sum()
     }
+    */
 
     #[inline]
     const fn piece_value_raw(t: PieceTy) -> i64 {
@@ -366,21 +443,13 @@ impl Engine {
     }
 
     fn get_game_stage(game: &Game) -> GameStage {
-        let mut queens: u8 = 0;
-        let mut major_minor: u8 = 0;
+        let p = |t| {
+            game.piece_count(Square::piece(t, Color::White))
+                + game.piece_count(Square::piece(t, Color::Black))
+        };
 
-        for (piece, _) in game.get_all_pieces() {
-            match piece.ty() {
-                PieceTy::Queen => {
-                    queens += 1;
-                    major_minor += 1;
-                }
-                PieceTy::Rook | PieceTy::Bishop | PieceTy::Knight => {
-                    major_minor += 1;
-                }
-                _ => {}
-            }
-        }
+        let queens = p(PieceTy::Queen);
+        let major_minor = p(PieceTy::Rook) + p(PieceTy::Bishop) + p(PieceTy::Knight);
 
         match (major_minor, queens) {
             (22.., _) => GameStage::Early,
@@ -389,6 +458,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     fn piece_pos(&self, stage: GameStage, piece: Square, pos: Pos) -> i64 {
         let table = match piece.ty() {
             PieceTy::Pawn => &PAWN_TABLE,
@@ -418,6 +488,8 @@ enum GameStage {
     Mid,
     End,
 }
+
+// TODO: add more end game tables
 
 const PAWN_TABLE: [[i64; 8]; 8] = [
     [0, 0, 0, 0, 0, 0, 0, 0],

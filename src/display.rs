@@ -162,14 +162,12 @@ impl App {
                                         promotion: None,
                                     };
 
-                                    if s != cursor_pos && self.board.is_valid(m) {
-                                        if self.board.get(m.from).ty() == PieceTy::Pawn
-                                            && (m.to.1 == 0 || m.to.1 == 7)
-                                        {
-                                            promotion_p = Some((m, 0))
-                                        } else {
-                                            self.board.move_piece(m);
-                                        }
+                                    if self.board.get(m.from).ty() == PieceTy::Pawn
+                                        && (m.to.1 == 0 || m.to.1 == 7)
+                                    {
+                                        promotion_p = Some((m, 0))
+                                    } else if s != cursor_pos && self.board.is_valid(m) {
+                                        self.board.move_piece(m);
                                     }
                                 } else {
                                     selected = Some(cursor_pos);
@@ -211,7 +209,7 @@ impl App {
     fn render(
         &self,
         frame: &mut Frame,
-        d: u32,
+        d: u16,
         player_info: Option<((isize, isize), Option<(isize, isize)>)>,
     ) {
         let area = frame.area();
@@ -219,9 +217,9 @@ impl App {
         let mut board_spans = Vec::with_capacity(8);
         for y in (0..8).rev() {
             let mut row_spans = Vec::with_capacity(8);
+            for x in 0..8 {
+                let place = self.board.get((x, y));
 
-            let rank = self.board.get_rank(y);
-            for (x, place) in rank.iter().enumerate() {
                 let is_dark = (x ^ y) % 2 == 0;
                 let style = if let Some((cursor_pos, _)) = player_info
                     && cursor_pos == (x as isize, y as isize)
@@ -245,7 +243,7 @@ impl App {
                 };
 
                 row_spans.push(Span::styled(
-                    format!(" {} ", Self::get_place_char(*place)),
+                    format!(" {} ", Self::get_place_char(place)),
                     style,
                 ))
             }
