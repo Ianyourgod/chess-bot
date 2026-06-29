@@ -3,11 +3,12 @@ use std::time::{Duration, Instant};
 use crate::game::{Color, Game, Move, PieceTy, Pos, Square};
 
 mod cache;
+
 #[allow(unused)]
 use cache::{Cache, CacheBound, CacheTrait, DashCache};
 
-const CHECKMATE: i64 = i64::MAX;
-const DRAW: i64 = -200;
+const CHECKMATE: i32 = i32::MAX;
+const DRAW: i32 = -200;
 
 const BASE_MOVE: Move = Move {
     from: (8, 8),
@@ -15,13 +16,13 @@ const BASE_MOVE: Move = Move {
     promotion: None,
 };
 
-const PIECE_MULT: i64 = 20;
-const PIECE_POS_MULT: i64 = 1;
+const PIECE_MULT: i32 = 32;
+const PIECE_POS_MULT: i32 = 2;
 #[allow(unused)]
-const MOBILITY_MULT: i64 = 1;
-const BISHOP_PAIRS: i64 = 5;
-const DOUBLED_PAWNS: i64 = -3;
-const TO_MOVE_BONUS: i64 = 2;
+const MOBILITY_MULT: i32 = 2;
+const BISHOP_PAIRS: i32 = 8;
+const DOUBLED_PAWNS: i32 = -4;
+const TO_MOVE_BONUS: i32 = 4;
 
 const MAX_EXTENSIONS: u16 = 16;
 const NULL_MOVE_REDUX: u16 = 3;
@@ -32,9 +33,11 @@ pub enum CalcConstraint {
     Depth(u16),
 }
 
+type CurrentCache = DashCache;
+
 #[derive(Debug, Clone)]
 pub struct Engine {
-    cache: DashCache,
+    cache: CurrentCache,
     start_time: Instant,
     constraint: CalcConstraint,
 }
@@ -42,10 +45,16 @@ pub struct Engine {
 impl Engine {
     pub fn new(constraint: CalcConstraint) -> Self {
         Self {
-            cache: DashCache::cache_new(),
+            cache: CurrentCache::cache_new(),
             start_time: Instant::now(),
             constraint,
         }
+    }
+
+    pub fn set_think_time(&mut self, inc: Duration, init: Duration) {
+        const MAYBE_MOVES: u32 = 60;
+        let time_per = (init / MAYBE_MOVES) + inc - Duration::from_millis(300);
+        self.constraint = CalcConstraint::Time(time_per)
     }
 
     #[inline]
@@ -53,7 +62,7 @@ impl Engine {
         self.start_time.elapsed()
     }
 
-    pub fn best_move(&mut self, game: &mut Game) -> (i64, Move, u16) {
+    pub fn best_move(&mut self, game: &mut Game) -> (i32, Move, u16) {
         let mut depth = 1;
 
         let mut best = self.eval_rec_base(game, depth);
@@ -62,11 +71,13 @@ impl Engine {
 
         loop {
             // TODO: figure out a way to only log when we're not doing ratatui stuff
+            /*
             println!(
                 "depth {} at {}ms",
                 depth,
                 self.start_time.elapsed().as_millis()
             );
+            */
 
             // -50 so that our move thing (prioritize late/early checkmates) still works with this
             if best.0 >= (CHECKMATE - 50) || self.timed_out(depth) {
@@ -104,15 +115,15 @@ impl Engine {
         }
     }
 
-    fn eval_rec_base(&mut self, game: &mut Game, depth: u16) -> (i64, Move) {
-        let mut best = (i64::MIN, BASE_MOVE);
+    fn eval_rec_base(&mut self, game: &mut Game, depth: u16) -> (i32, Move) {
+        let mut best = (i32::MIN, BASE_MOVE);
         let p_moves = game.get_all_moves(game.get_to_move());
 
         if self.timed_out(depth) {
             return (0, BASE_MOVE);
         }
 
-        let mut scored: Vec<(i64, Move)> = p_moves
+        let mut scored: Vec<(i32, Move)> = p_moves
             .into_iter()
             .map(|m| (self.move_order_score(game, m), m))
             .collect();
@@ -137,11 +148,11 @@ impl Engine {
         &mut self,
         game: &mut Game,
         depth: u16,
-        mut alpha: i64,
-        mut beta: i64,
+        mut alpha: i32,
+        mut beta: i32,
         moves: usize,
         extensions_left: u16,
-    ) -> i64 {
+    ) -> i32 {
         if self.timed_out(depth) {
             return 0;
         }
@@ -190,7 +201,7 @@ impl Engine {
 
         let original_alpha = alpha;
 
-        let mut best = -i64::MAX;
+        let mut best = -i32::MAX;
         let mut p_moves = game.get_all_moves(game.get_to_move());
 
         p_moves.sort_unstable_by(|a, b| {
@@ -253,15 +264,15 @@ impl Engine {
         best
     }
 
-    fn move_order_score(&self, game: &mut Game, m: Move) -> i64 {
+    fn move_order_score(&self, game: &mut Game, m: Move) -> i32 {
         let moving = game.get(m.from);
 
-        if game.is_capture(m) {
+        if let Some(en_pass) = game.is_capture_known_move(m, moving) {
             let captured = game.get(m.to);
-            let victim = if !captured.is_empty() {
-                Self::piece_value_raw(captured.ty())
+            let victim = if en_pass {
+                Self::piece_value_raw(PieceTy::Pawn)
             } else {
-                Self::piece_value_raw(PieceTy::Pawn) // en pass
+                Self::piece_value_raw(captured.ty())
             };
             let attacker = Self::piece_value_raw(moving.ty());
             return 10_000 + victim * 10 - attacker;
@@ -271,7 +282,7 @@ impl Engine {
             return 9_000;
         }
 
-        let hash = game.hash_after_move(m);
+        let hash = game.hash_after_move(m, moving);
         if let Some(entry) = self.cache.cache_get(hash) {
             return 1_000 - entry.0.clamp(-999, 999);
         }
@@ -279,7 +290,7 @@ impl Engine {
         0
     }
 
-    fn eval_base(&mut self, game: &Game, moves: usize) -> i64 {
+    fn eval_base(&mut self, game: &Game, moves: usize) -> i32 {
         if !game.has_been_played(game)
             && let Some((score, _, CacheBound::Exact)) = self.cache.cache_get(game.get_hash())
         {
@@ -287,7 +298,7 @@ impl Engine {
         }
 
         if game.checkmate(game.get_to_move()) {
-            return -CHECKMATE + moves as i64;
+            return -CHECKMATE + moves as i32;
         }
 
         let player = self.eval_base_color(game, game.get_to_move()) + TO_MOVE_BONUS;
@@ -296,14 +307,14 @@ impl Engine {
         player - enemy
     }
 
-    fn eval_base_color(&self, game: &Game, c: Color) -> i64 {
+    fn eval_base_color(&self, game: &Game, c: Color) -> i32 {
         let basic_piece_score = Self::get_piece_score_color(game, c) * PIECE_MULT;
 
         let stage = Self::get_game_stage(game);
         let piece_pos_values = game
             .get_all_pieces_color(c)
             .map(|(p, pos)| self.piece_pos(stage, p, pos))
-            .sum::<i64>()
+            .sum::<i32>()
             * PIECE_POS_MULT;
 
         // TODO: reenable this once we make mobility better (cheaper)
@@ -312,7 +323,7 @@ impl Engine {
 
         let bishop_count = game.get_all_pieces_ty_color(PieceTy::Bishop, c).count();
 
-        let bishop_pairs = (bishop_count >= 2) as i64 * BISHOP_PAIRS;
+        let bishop_pairs = (bishop_count >= 2) as i32 * BISHOP_PAIRS;
 
         let doubled_pawns = game.doubled_pawns_check(c) * DOUBLED_PAWNS;
 
@@ -322,7 +333,7 @@ impl Engine {
     }
 
     #[allow(unused)]
-    fn mobility(&self, game: &Game, color: Color) -> i64 {
+    fn mobility(&self, game: &Game, color: Color) -> i32 {
         // TODO: use get_all_pseudo moves somehow
 
         game.get_all_moves(color)
@@ -349,13 +360,13 @@ impl Engine {
         game.get((m.to.0, m.from.1))
     }
 
-    fn quiescence(&mut self, game: &mut Game, mut alpha: i64, beta: i64, moves: usize) -> i64 {
+    fn quiescence(&mut self, game: &mut Game, mut alpha: i32, beta: i32, moves: usize) -> i32 {
         let stand_pat = self.eval_base(game, moves);
         if stand_pat >= beta {
             return beta;
         }
 
-        const DELTA_MARGIN: i64 = Engine::piece_value_raw(PieceTy::Queen) * PIECE_MULT;
+        const DELTA_MARGIN: i32 = Engine::piece_value_raw(PieceTy::Queen) * PIECE_MULT;
         if stand_pat + DELTA_MARGIN < alpha {
             return alpha;
         }
@@ -403,7 +414,7 @@ impl Engine {
         alpha
     }
 
-    fn get_piece_score_color(game: &Game, c: Color) -> i64 {
+    fn get_piece_score_color(game: &Game, c: Color) -> i32 {
         game.get_all_pieces_color(c)
             .map(|p| Self::piece_value_raw(p.0.ty()))
             .fold(0, |a, b| a + b)
@@ -411,10 +422,10 @@ impl Engine {
 
     /*
     // this is somehow slower than the top one
-    fn get_total_piece_score(game: &Game) -> i64 {
+    fn get_total_piece_score(game: &Game) -> i32 {
         let p = |t| {
             (game.piece_count(Square::piece(t, Color::White))
-                - game.piece_count(Square::piece(t, Color::Black))) as i64
+                - game.piece_count(Square::piece(t, Color::Black))) as i32
         };
 
         [
@@ -432,7 +443,7 @@ impl Engine {
     */
 
     #[inline]
-    const fn piece_value_raw(t: PieceTy) -> i64 {
+    const fn piece_value_raw(t: PieceTy) -> i32 {
         match t {
             PieceTy::Pawn => 1,
             PieceTy::Bishop | PieceTy::Knight => 3,
@@ -459,7 +470,7 @@ impl Engine {
     }
 
     #[inline]
-    fn piece_pos(&self, stage: GameStage, piece: Square, pos: Pos) -> i64 {
+    fn piece_pos(&self, stage: GameStage, piece: Square, pos: Pos) -> i32 {
         let table = match piece.ty() {
             PieceTy::Pawn => &PAWN_TABLE,
             PieceTy::Knight => &KNIGHT_TABLE,
@@ -491,7 +502,7 @@ enum GameStage {
 
 // TODO: add more end game tables
 
-const PAWN_TABLE: [[i64; 8]; 8] = [
+const PAWN_TABLE: [[i32; 8]; 8] = [
     [0, 0, 0, 0, 0, 0, 0, 0],
     [50, 50, 50, 50, 50, 50, 50, 50],
     [10, 10, 20, 30, 30, 20, 10, 10],
@@ -502,7 +513,7 @@ const PAWN_TABLE: [[i64; 8]; 8] = [
     [0, 0, 0, 0, 0, 0, 0, 0],
 ];
 
-const KNIGHT_TABLE: [[i64; 8]; 8] = [
+const KNIGHT_TABLE: [[i32; 8]; 8] = [
     [-50, -40, -30, -30, -30, -30, -40, -50],
     [-40, -20, 0, 0, 0, 0, -20, -40],
     [-30, 0, 10, 15, 15, 10, 0, -30],
@@ -513,7 +524,7 @@ const KNIGHT_TABLE: [[i64; 8]; 8] = [
     [-50, -40, -30, -30, -30, -30, -40, -50],
 ];
 
-const BISHOP_TABLE: [[i64; 8]; 8] = [
+const BISHOP_TABLE: [[i32; 8]; 8] = [
     [-20, -10, -10, -10, -10, -10, -10, -20],
     [-10, 0, 0, 0, 0, 0, 0, -10],
     [-10, 0, 5, 10, 10, 5, 0, -10],
@@ -524,7 +535,7 @@ const BISHOP_TABLE: [[i64; 8]; 8] = [
     [-20, -10, -10, -10, -10, -10, -10, -20],
 ];
 
-const ROOK_TABLE: [[i64; 8]; 8] = [
+const ROOK_TABLE: [[i32; 8]; 8] = [
     [0, 0, 0, 0, 0, 0, 0, 0],
     [5, 10, 10, 10, 10, 10, 10, 5],
     [-5, 0, 0, 0, 0, 0, 0, -5],
@@ -535,7 +546,7 @@ const ROOK_TABLE: [[i64; 8]; 8] = [
     [0, 0, 0, 5, 5, 0, 0, 0],
 ];
 
-const QUEEN_TABLE: [[i64; 8]; 8] = [
+const QUEEN_TABLE: [[i32; 8]; 8] = [
     [-20, -10, -10, -5, -5, -10, -10, -20],
     [-10, 0, 0, 0, 0, 0, 0, -10],
     [-10, 0, 5, 5, 5, 5, 0, -10],
@@ -546,7 +557,7 @@ const QUEEN_TABLE: [[i64; 8]; 8] = [
     [-20, -10, -10, -5, -5, -10, -10, -20],
 ];
 
-const KING_EARLY_TABLE: [[i64; 8]; 8] = [
+const KING_EARLY_TABLE: [[i32; 8]; 8] = [
     [-30, -40, -40, -50, -50, -40, -40, -30],
     [-30, -40, -40, -50, -50, -40, -40, -30],
     [-30, -40, -40, -50, -50, -40, -40, -30],
@@ -557,7 +568,7 @@ const KING_EARLY_TABLE: [[i64; 8]; 8] = [
     [20, 30, 10, 0, 0, 10, 30, 20],
 ];
 
-const KING_END_TABLE: [[i64; 8]; 8] = [
+const KING_END_TABLE: [[i32; 8]; 8] = [
     [-50, -40, -30, -20, -20, -30, -40, -50],
     [-30, -20, -10, 0, 0, -10, -20, -30],
     [-30, -10, 20, 30, 30, 20, -10, -30],

@@ -1,14 +1,28 @@
+use dotenv::dotenv;
+use futures_util::StreamExt;
+use litchee::{
+    LichessClient,
+    api::gameplay::{
+        board::{LichessBoardEvent, LichessGameEventInfo, LichessIncomingEvent},
+        games::LichessGameStatusName,
+    },
+    model::LichessColor,
+};
+
 mod display;
 mod eval_engine;
 mod game;
 
-fn main() {
+#[tokio::main]
+async fn main() -> litchee::Result<()> {
+    dotenv().ok();
+
     let mut args = std::env::args().skip(1);
     let p = args.next();
 
     let Some(p) = p else {
         player_vs_bot();
-        return;
+        return Ok(());
     };
 
     match p.as_str() {
@@ -27,8 +41,142 @@ fn main() {
         "test_possible" => {
             test_possible(args.next().map(|n| n.parse::<u16>().unwrap()).unwrap_or(7))
         }
+        "write_magic" => {
+            std::fs::write(
+                "magics_bishop.txt",
+                format!(
+                    "{:?}",
+                    (game::magic_bb::BISHOP_MAGICS)
+                        .iter()
+                        .map(|m| (m.magic, m.shift))
+                        .collect::<Vec<_>>()
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                "magics_rook.txt",
+                format!(
+                    "{:?}",
+                    game::magic_bb::ROOK_MAGICS
+                        .iter()
+                        .map(|m| (m.magic, m.shift))
+                        .collect::<Vec<_>>()
+                ),
+            )
+            .unwrap();
+        }
+        "lichess" => {
+            let client = LichessClient::builder()
+                .token(std::env::var("LICHESS_TOKEN").unwrap())
+                .build()?;
+
+            let me = client.account().profile().await?;
+            println!("Logged in as {}", me.user.username);
+
+            let mut events = client.bot().stream_events().await?;
+
+            while let Some(event) = events.next().await {
+                match event? {
+                    LichessIncomingEvent::Challenge { challenge } => {
+                        client.challenges().accept(&challenge.id).await?;
+                    }
+                    LichessIncomingEvent::GameStart { game } => {
+                        let client = client.clone();
+
+                        tokio::spawn(async move {
+                            if let Err(e) = lichess_play_game(client, game).await {
+                                eprintln!("{e:?}");
+                            }
+                        });
+                    }
+
+                    e => eprintln!("WARNING: ignoring event {:?}", e),
+                }
+            }
+        }
         c => panic!("unknown arg \"{c}\""),
+    };
+
+    Ok(())
+}
+
+async fn lichess_play_game(
+    client: LichessClient,
+    game: LichessGameEventInfo,
+) -> litchee::Result<()> {
+    let id = game.game_id.unwrap();
+    let mut stream = client.bot().stream_game(&id).await?;
+
+    let mut current_game = game::Game::default();
+    let bot_color = match game.color.unwrap() {
+        LichessColor::Black => game::Color::Black,
+        LichessColor::White => game::Color::White,
+    };
+
+    println!("{:?}", bot_color);
+
+    let mut bot = eval_engine::Engine::new(eval_engine::CalcConstraint::Time(
+        std::time::Duration::from_millis(5000),
+    ));
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            LichessBoardEvent::ChatLine(msg) => println!("{}: {}", msg.username, msg.text),
+            LichessBoardEvent::GameFull(data) => {
+                if let Some(clock) = data.clock {
+                    let (inc, init) = (
+                        std::time::Duration::from_millis(clock.increment.unwrap() as u64),
+                        std::time::Duration::from_millis(clock.initial.unwrap() as u64),
+                    );
+                    bot.set_think_time(inc, init);
+                } else {
+                    bot.set_think_time(
+                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(0),
+                    );
+                }
+
+                let fen = data.initial_fen.unwrap();
+                if fen == "startpos" {
+                    current_game = game::Game::default();
+                } else {
+                    current_game = game::Game::from_fen(&fen);
+                }
+                for m in data.state.moves.split(' ').filter(|m| !m.is_empty()) {
+                    let m = game::Move::from_str(m);
+                    current_game.move_piece(m);
+                }
+            }
+            LichessBoardEvent::GameState(state) => {
+                match state.status {
+                    LichessGameStatusName::Started => (),
+                    _ => return Ok(()),
+                }
+
+                let m = state.moves.split(' ').last().unwrap();
+                let m = game::Move::from_str(m);
+                current_game.move_piece(m);
+
+                if current_game.get_to_move() == bot_color {
+                    let best = bot.best_move(&mut current_game);
+
+                    println!("eval: {}, depth: {}", best.0, best.2);
+
+                    let best = best.1;
+
+                    client
+                        .bot()
+                        .make_move(&id, &best.to_string(), false)
+                        .await
+                        .unwrap();
+                }
+            }
+            LichessBoardEvent::OpponentGone(_) => (),
+            a => println!("WARNING: skipping unknown board event: {:?}", a),
+        }
     }
+
+    Ok(())
 }
 
 #[allow(unused)]
@@ -77,6 +225,8 @@ fn flame_on(moves: u16, time_ms: u64) {
 }
 
 fn speed(depth: u16) -> std::time::Duration {
+    println!("running speed test...");
+
     let wait_time = eval_engine::CalcConstraint::Depth(depth);
 
     let mut game = game::Game::default();

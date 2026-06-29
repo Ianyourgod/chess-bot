@@ -1,6 +1,8 @@
 use rand::{prelude::*, rngs::SmallRng};
 use std::sync::LazyLock;
 
+pub mod magic_bb;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Square(u8);
 
@@ -90,7 +92,7 @@ pub enum Color {
 }
 
 impl Color {
-    pub fn to_int(self) -> i64 {
+    pub fn to_int(self) -> i32 {
         match self {
             Self::White => 1,
             Self::Black => -1,
@@ -129,6 +131,74 @@ pub struct Move {
     pub from: Pos,
     pub to: Pos,
     pub promotion: Option<PieceTy>,
+}
+
+impl Move {
+    pub fn from_str(m: &str) -> Self {
+        let (from, to_ish) = m.split_at(2);
+        let (to, promo) = to_ish.split_at(2);
+        let promo = (!promo.is_empty()).then(|| match promo {
+            "q" => PieceTy::Queen,
+            "r" => PieceTy::Rook,
+            "n" => PieceTy::Knight,
+            "b" => PieceTy::Bishop,
+            _ => panic!("thats not a valid promotion"),
+        });
+        let parse_pos = |p: &str| {
+            let (row, col) = p.split_at(1);
+            let x = match row {
+                "a" => 0,
+                "b" => 1,
+                "c" => 2,
+                "d" => 3,
+                "e" => 4,
+                "f" => 5,
+                "g" => 6,
+                "h" => 7,
+                _ => panic!("invalid FEN string"),
+            };
+            let y = col.parse::<usize>().unwrap() - 1;
+            (x, y)
+        };
+        Move {
+            from: parse_pos(from),
+            to: parse_pos(to),
+            promotion: promo,
+        }
+    }
+
+    pub fn to_string(self) -> String {
+        let stringify_pos = |p: Pos| {
+            let row = match p.0 {
+                0 => "a",
+                1 => "b",
+                2 => "c",
+                3 => "d",
+                4 => "e",
+                5 => "f",
+                6 => "g",
+                7 => "h",
+                _ => panic!("invalid FEN move"),
+            }
+            .to_string();
+            let col = (p.1 + 1).to_string();
+            row + &col
+        };
+
+        stringify_pos(self.from)
+            + &stringify_pos(self.to)
+            + if let Some(p) = self.promotion {
+                match p {
+                    PieceTy::Queen => "q",
+                    PieceTy::Rook => "r",
+                    PieceTy::Bishop => "b",
+                    PieceTy::Knight => "n",
+                    _ => unreachable!(),
+                }
+            } else {
+                ""
+            }
+    }
 }
 
 type Board = [[Square; 8]; 8];
@@ -484,9 +554,8 @@ impl Game {
             >= 2
     }
 
-    pub fn hash_after_move(&self, m: Move) -> u64 {
+    pub fn hash_after_move(&self, m: Move, moving: Square) -> u64 {
         let mut hash = self.hash;
-        let moving = self.get(m.from);
 
         let c = moving.color().to_index();
         let ec = 1 - c;
@@ -584,6 +653,12 @@ impl Game {
             let t = self.get(m.to);
             (!t.is_empty()).then_some((t, m.to))
         };
+
+        if let Some(cap) = capture
+            && cap.0.ty() == PieceTy::King
+        {
+            panic!("capturing king!");
+        }
 
         self.prev_pos.push(self.hash);
         self.moves.push(Undo {
@@ -823,7 +898,7 @@ impl Game {
         let c = color.to_index();
         let from_sq = sq(m.from);
         let to_sq = sq(m.to);
-        let to_bit = 1u64 << to_sq;
+        let to_bit = bit(to_sq);
         let all = self.board.all;
 
         let target = self.get(m.to);
@@ -836,11 +911,26 @@ impl Game {
             PieceTy::Knight => {
                 m.promotion.is_none() && KNIGHT_ATTACKS[from_sq as usize] & to_bit != 0
             }
-            PieceTy::Bishop => m.promotion.is_none() && bishop_attacks(from_sq, all) & to_bit != 0,
-            PieceTy::Rook => m.promotion.is_none() && rook_attacks(from_sq, all) & to_bit != 0,
+            PieceTy::Bishop => {
+                m.promotion.is_none()
+                    && magic_bb::BISHOP_MAGICS[from_sq as usize]
+                        .get(self.board.all, self.board.color[c])
+                        & to_bit
+                        != 0
+            }
+            PieceTy::Rook => {
+                m.promotion.is_none()
+                    && magic_bb::ROOK_MAGICS[from_sq as usize]
+                        .get(self.board.all, self.board.color[c])
+                        & to_bit
+                        != 0
+            }
             PieceTy::Queen => {
                 m.promotion.is_none()
-                    && (bishop_attacks(from_sq, all) | rook_attacks(from_sq, all)) & to_bit != 0
+                    && (magic_bb::BISHOP_MAGICS[from_sq as usize].get(all, self.board.color[c])
+                        | magic_bb::ROOK_MAGICS[from_sq as usize].get(all, self.board.color[c]))
+                        & to_bit
+                        != 0
             }
             PieceTy::King => self.is_valid_king(m, color, c),
         };
@@ -858,6 +948,11 @@ impl Game {
         let ec = 1 - c;
         let king_sq = self.board.pieces[c][BB_KING].trailing_zeros();
 
+        let to_bit = bit(sq(m.to));
+        if self.board.color[c] & to_bit != 0 || self.board.pieces[ec][BB_KING] & to_bit != 0 {
+            return false;
+        }
+
         if moving.ty() != PieceTy::King && !in_check {
             let is_ep = moving.ty() == PieceTy::Pawn && Some(m.to) == self.enpass;
 
@@ -873,14 +968,19 @@ impl Game {
                     return true;
                 }
 
-                let occ_without = self.board.all & !bit(sq(m.from));
                 let diag_pinners =
                     self.board.pieces[ec][BB_BISHOP] | self.board.pieces[ec][BB_QUEEN];
                 let straight_pinners =
                     self.board.pieces[ec][BB_ROOK] | self.board.pieces[ec][BB_QUEEN];
 
-                let pinned_diag = bishop_attacks(king_sq, occ_without) & diag_pinners != 0;
-                let pinned_straight = rook_attacks(king_sq, occ_without) & straight_pinners != 0;
+                let pinned_diag = magic_bb::BISHOP_MAGICS[king_sq as usize]
+                    .get(self.board.all, self.board.color[c])
+                    & diag_pinners
+                    != 0;
+                let pinned_straight = magic_bb::BISHOP_MAGICS[king_sq as usize]
+                    .get(self.board.all, self.board.color[c])
+                    & straight_pinners
+                    != 0;
 
                 if !pinned_diag && !pinned_straight {
                     return true;
@@ -1068,12 +1168,12 @@ impl Game {
             return true;
         }
 
-        let diag = bishop_attacks(sq, board.all);
+        let diag = magic_bb::BISHOP_MAGICS[sq as usize].get(board.all, board.color[1 - c]);
         if diag & (board.pieces[c][BB_BISHOP] | board.pieces[c][BB_QUEEN]) != 0 {
             return true;
         }
 
-        let straight = rook_attacks(sq, board.all);
+        let straight = magic_bb::ROOK_MAGICS[sq as usize].get(board.all, board.color[1 - c]);
         if straight & (board.pieces[c][BB_ROOK] | board.pieces[c][BB_QUEEN]) != 0 {
             return true;
         }
@@ -1100,7 +1200,6 @@ impl Game {
         (not_in_check && no_moves) || repeat
     }
 
-    #[inline]
     pub fn is_capture(&self, m: Move) -> bool {
         if self.occupied(m.to) {
             return true;
@@ -1114,6 +1213,19 @@ impl Game {
         }
 
         false
+    }
+
+    /// returns Option<bool> Some if capture, true if en passant
+    pub fn is_capture_known_move(&self, m: Move, moving: Square) -> Option<bool> {
+        if self.occupied(m.to) {
+            return Some(false);
+        }
+
+        if moving.ty() == PieceTy::Pawn && m.from.0 != m.to.0 {
+            return Some(true);
+        }
+
+        None
     }
 
     pub fn get_all_moves(&self, c: Color) -> Vec<Move> {
@@ -1292,11 +1404,11 @@ impl Game {
         }
     }
 
-    fn gen_bishop_moves(&self, c: usize, own: BB, occ: BB, moves: &mut Vec<Move>) {
+    fn gen_bishop_moves(&self, c: usize, own: BB, all: BB, moves: &mut Vec<Move>) {
         let mut pieces = self.board.pieces[c][BB_BISHOP];
         while pieces != 0 {
             let from = pop_lsb(&mut pieces);
-            let mut targets = bishop_attacks(from, occ) & !own;
+            let mut targets = magic_bb::BISHOP_MAGICS[from as usize].get(all, own);
             while targets != 0 {
                 let to = pop_lsb(&mut targets);
                 moves.push(Move {
@@ -1308,11 +1420,11 @@ impl Game {
         }
     }
 
-    fn gen_rook_moves(&self, c: usize, own: BB, occ: BB, moves: &mut Vec<Move>) {
+    fn gen_rook_moves(&self, c: usize, own: BB, all: BB, moves: &mut Vec<Move>) {
         let mut pieces = self.board.pieces[c][BB_ROOK];
         while pieces != 0 {
             let from = pop_lsb(&mut pieces);
-            let mut targets = rook_attacks(from, occ) & !own;
+            let mut targets = magic_bb::ROOK_MAGICS[from as usize].get(all, own);
             while targets != 0 {
                 let to = pop_lsb(&mut targets);
                 moves.push(Move {
@@ -1328,7 +1440,8 @@ impl Game {
         let mut pieces = self.board.pieces[c][BB_QUEEN];
         while pieces != 0 {
             let from = pop_lsb(&mut pieces);
-            let mut targets = (bishop_attacks(from, all) | rook_attacks(from, all)) & !own;
+            let mut targets = magic_bb::BISHOP_MAGICS[from as usize].get(all, own)
+                | magic_bb::ROOK_MAGICS[from as usize].get(all, own);
             while targets != 0 {
                 let to = pop_lsb(&mut targets);
                 moves.push(Move {
@@ -1411,7 +1524,7 @@ impl Game {
         self.board.pieces[s.color().to_index()][s.ty() as usize - 1].count_ones()
     }
 
-    pub fn doubled_pawns_check(&self, color: Color) -> i64 {
+    pub fn doubled_pawns_check(&self, color: Color) -> i32 {
         let board = self.board.pieces[color.to_index()][BB_PAWN];
         (0..8)
             .map(|r| {
@@ -1419,7 +1532,7 @@ impl Game {
 
                 let pawns = (board & rank).count_ones();
 
-                if pawns > 1 { pawns as i64 - 1 } else { 0 }
+                if pawns > 1 { pawns as i32 - 1 } else { 0 }
             })
             .sum()
     }
@@ -1490,6 +1603,13 @@ static RANK_MASKS: LazyLock<[BB; 64]> =
 static FILE_MASKS: LazyLock<[BB; 64]> =
     LazyLock::new(|| std::array::from_fn(|sq| FILE_A << (sq % 8)));
 
+#[allow(unused)]
+static RANK_AND_FILE_MASKS: LazyLock<[BB; 64]> =
+    LazyLock::new(|| std::array::from_fn(|i| RANK_MASKS[i] | FILE_MASKS[i]));
+
+// TODO: rook mask (don't include ends)
+// TODO: bishop mask (don't include ends)
+
 // top right -> bottom left
 static DIAGONAL_MASKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
     std::array::from_fn(|sq| {
@@ -1517,32 +1637,6 @@ static ANTI_DIAGONAL_MASKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
         mask
     })
 });
-
-#[inline]
-fn hyperbola_quintessence(sq: u32, all: BB, mask: BB) -> BB {
-    let o = all & mask;
-    let s = bit(sq);
-
-    let forward = o.wrapping_sub(s.wrapping_mul(2));
-
-    let ro = o.reverse_bits();
-    let rs = bit(63 - sq);
-    let backward = (ro.wrapping_sub(rs.wrapping_mul(2))).reverse_bits();
-
-    (forward ^ backward) & mask
-}
-
-#[inline]
-pub fn bishop_attacks(sq: u32, all: BB) -> BB {
-    hyperbola_quintessence(sq, all, DIAGONAL_MASKS[sq as usize])
-        | hyperbola_quintessence(sq, all, ANTI_DIAGONAL_MASKS[sq as usize])
-}
-
-#[inline]
-pub fn rook_attacks(sq: u32, all: BB) -> BB {
-    hyperbola_quintessence(sq, all, RANK_MASKS[sq as usize])
-        | hyperbola_quintessence(sq, all, FILE_MASKS[sq as usize])
-}
 
 const FILE_A: u64 = 0x0101010101010101;
 const FILE_B: u64 = FILE_A << 1;
