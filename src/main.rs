@@ -235,6 +235,11 @@ fn speed(depth: u16) -> std::time::Duration {
 
     engine.best_move(&mut game);
 
+    println!(
+        "searched {} nodes",
+        *eval_engine::NODES_SEARCHED.lock().unwrap()
+    );
+
     engine.elapsed()
 }
 

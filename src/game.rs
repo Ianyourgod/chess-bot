@@ -1,7 +1,7 @@
-use rand::{prelude::*, rngs::SmallRng};
-use std::sync::LazyLock;
-
 pub mod magic_bb;
+mod zobrists;
+
+use zobrists::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Square(u8);
@@ -100,7 +100,7 @@ impl Color {
     }
 
     #[inline]
-    pub fn to_index(&self) -> usize {
+    pub const fn to_index(&self) -> usize {
         match self {
             Self::White => 0,
             Self::Black => 1,
@@ -203,34 +203,6 @@ impl Move {
 
 type Board = [[Square; 8]; 8];
 
-static ZOBRIST_TABLE: LazyLock<[[[u64; 16]; 8]; 8]> = LazyLock::new(|| {
-    let mut rng = SmallRng::from_seed(*b"andrewrobsonlovespenis1234567890");
-    let mut z = [[[0u64; 16]; 8]; 8];
-    for y in 0..8 {
-        for x in 0..8 {
-            for p in 0..16 {
-                z[y][x][p] = rng.next_u64();
-            }
-        }
-    }
-    z
-});
-static ZOBRIST_SIDE_TO_MOVE: LazyLock<u64> =
-    LazyLock::new(|| SmallRng::from_seed(*b"sideblck00000000000000000000000a").next_u64());
-
-static ZOBRIST_CASTLING: LazyLock<[[u64; 2]; 2]> = LazyLock::new(|| {
-    let mut rng = SmallRng::from_seed(*b"castling00000000000000000000000b");
-    [
-        [rng.next_u64(), rng.next_u64()],
-        [rng.next_u64(), rng.next_u64()],
-    ]
-});
-
-static ZOBRIST_ENPASS: LazyLock<[u64; 8]> = LazyLock::new(|| {
-    let mut rng = SmallRng::from_seed(*b"enpassnt00000000000000000000000c");
-    std::array::from_fn(|_| rng.next_u64())
-});
-
 #[derive(Debug, Clone)]
 struct PrevPos {
     previous_positions: [u64; 256],
@@ -298,13 +270,13 @@ fn sq_to_pos(sq: u32) -> Pos {
     ((sq % 8) as usize, (sq / 8) as usize)
 }
 #[inline]
-fn bit(sq: u32) -> BB {
+const fn bit(sq: u32) -> BB {
     1u64 << sq
 }
 #[inline]
-fn pop_lsb(bb: &mut BB) -> u32 {
+const fn pop_lsb(bb: &mut BB) -> u32 {
     let sq = bb.trailing_zeros();
-    *bb &= *bb - 1;
+    *bb &= bb.wrapping_sub(1);
     sq
 }
 #[inline]
@@ -420,7 +392,7 @@ impl Game {
             }
         }
         if to_move == Color::Black {
-            h ^= *ZOBRIST_SIDE_TO_MOVE;
+            h ^= ZOBRIST_SIDE_TO_MOVE;
         }
         for color in 0..2 {
             if castleable[color].0 {
@@ -431,7 +403,7 @@ impl Game {
             }
         }
         if let Some((file, _)) = enpass {
-            h ^= ZOBRIST_ENPASS[file];
+            h ^= ZOBRIST_ENPASS[to_move.other().to_index()][file];
         }
         h
     }
@@ -577,10 +549,10 @@ impl Game {
             hash ^= ZOBRIST_TABLE[cap_pos.1][cap_pos.0][cap_sq.to_usize() - 1];
         }
         if let Some(ep) = self.enpass {
-            hash ^= ZOBRIST_ENPASS[ep.0];
+            hash ^= ZOBRIST_ENPASS[ec][ep.0];
         }
         if moving.ty() == PieceTy::Pawn && m.from.1.abs_diff(m.to.1) == 2 {
-            hash ^= ZOBRIST_ENPASS[m.to.0];
+            hash ^= ZOBRIST_ENPASS[c][m.to.0];
         }
 
         let old_cas = self.castleable;
@@ -631,7 +603,7 @@ impl Game {
         };
         hash ^= ZOBRIST_TABLE[m.to.1][m.to.0][final_sq.to_usize()];
 
-        hash ^= *ZOBRIST_SIDE_TO_MOVE;
+        hash ^= ZOBRIST_SIDE_TO_MOVE;
 
         hash
     }
@@ -683,13 +655,13 @@ impl Game {
         }
 
         if let Some(ep) = self.enpass {
-            self.hash ^= ZOBRIST_ENPASS[ep.0];
+            self.hash ^= ZOBRIST_ENPASS[ec][ep.0];
         }
         self.enpass = None;
         if moving.ty() == PieceTy::Pawn && m.from.1.abs_diff(m.to.1) == 2 {
             let mid_y = (m.from.1 + m.to.1) / 2;
             self.enpass = Some((m.to.0, mid_y));
-            self.hash ^= ZOBRIST_ENPASS[m.to.0];
+            self.hash ^= ZOBRIST_ENPASS[c][m.to.0];
         }
 
         let old_cas = self.castleable;
@@ -755,7 +727,7 @@ impl Game {
         self.board.color[c] |= to_bit;
         self.board.all |= to_bit;
 
-        self.hash ^= *ZOBRIST_SIDE_TO_MOVE;
+        self.hash ^= ZOBRIST_SIDE_TO_MOVE;
         self.to_move = self.to_move.other();
     }
 
@@ -826,12 +798,12 @@ impl Game {
                 promotion: None,
             },
         });
-        self.to_move = self.to_move.other();
-        self.hash ^= *ZOBRIST_SIDE_TO_MOVE;
         if let Some(ep) = self.enpass {
-            self.hash ^= ZOBRIST_ENPASS[ep.0];
+            self.hash ^= ZOBRIST_ENPASS[self.to_move.to_index()][ep.0];
         }
         self.enpass = None;
+        self.to_move = self.to_move.other();
+        self.hash ^= ZOBRIST_SIDE_TO_MOVE;
     }
 
     fn apply_move_board(&self, bb: &mut BitBoards, m: Move, moving: Square) {
@@ -977,7 +949,7 @@ impl Game {
                     .get(self.board.all, self.board.color[c])
                     & diag_pinners
                     != 0;
-                let pinned_straight = magic_bb::BISHOP_MAGICS[king_sq as usize]
+                let pinned_straight = magic_bb::ROOK_MAGICS[king_sq as usize]
                     .get(self.board.all, self.board.color[c])
                     & straight_pinners
                     != 0;
@@ -1241,6 +1213,7 @@ impl Game {
         // we use a vec instead of an array because returning an array is expensive. we COULD use an out parameter
         // which might be a good idea to prevent the expensiveness of heap allocation
         // TODO
+        // update: tried it. didn't seem faster.
         let mut moves = Vec::with_capacity(64);
         let c = color.to_index();
         let own = self.board.color[c];
@@ -1544,6 +1517,23 @@ impl Game {
             | self.board.pieces[1][BB_KING])
             == self.board.all
     }
+
+    #[allow(unused)]
+    pub fn passed_pawns_check(&self, c: Color) -> i32 {
+        let cx = c.to_index();
+        let us = self.board.pieces[cx][BB_PAWN];
+        let them = self.board.pieces[1 - cx][BB_PAWN];
+        let mut count = 0;
+        let mut bb = us;
+        while bb != 0 {
+            let sq = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            if them & PASSED_MASK[cx][sq] == 0 {
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 impl Default for Game {
@@ -1552,19 +1542,57 @@ impl Default for Game {
     }
 }
 
-pub static PAWN_ATTACKS: LazyLock<[[BB; 64]; 2]> = LazyLock::new(|| {
+static PASSED_MASK: [[u64; 64]; 2] = compute_passed_masks();
+
+const fn min(n1: usize, n2: usize) -> usize {
+    if n1 < n2 { n1 } else { n2 }
+}
+
+const fn compute_passed_masks() -> [[u64; 64]; 2] {
+    let mut masks = [[0u64; 64]; 2];
+    let mut sq = 0;
+
+    while sq < 64 {
+        let file = sq % 8;
+        let rank = sq / 8;
+        let files =
+            FILE_MASKS[file] | FILE_MASKS[file.saturating_sub(1)] | FILE_MASKS[min(file + 1, 7)];
+        masks[Color::White.to_index()][sq] = files
+            & if rank == 7 {
+                0
+            } else {
+                u64::MAX << (8 * (rank + 1))
+            };
+        masks[Color::Black.to_index()][sq] = files
+            & if rank == 0 {
+                0
+            } else {
+                u64::MAX >> (8 * (8 - rank))
+            };
+        sq += 1;
+    }
+    masks
+}
+
+const fn gen_pawn_attacks() -> [[BB; 64]; 2] {
     let mut attacks = [[0u64; 64]; 2];
-    for sq in 0..64u32 {
+    let mut sq = 0;
+    while sq < 64 {
         let b = 1u64 << sq;
 
         attacks[0][sq as usize] = ((b & !FILE_A) << 7) | ((b & !FILE_H) << 9);
         attacks[1][sq as usize] = ((b & !FILE_A) >> 9) | ((b & !FILE_H) >> 7);
+        sq += 1;
     }
     attacks
-});
+}
 
-static KNIGHT_ATTACKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
-    std::array::from_fn(|sq| {
+static PAWN_ATTACKS: [[BB; 64]; 2] = gen_pawn_attacks();
+
+const fn gen_knight_attacks() -> [BB; 64] {
+    let mut masks = [0; 64];
+    let mut sq = 0;
+    while sq < 64 {
         let b = bit(sq as u32);
         let mut att = 0u64;
         att |= (b << 17) & !FILE_A;
@@ -1575,12 +1603,18 @@ static KNIGHT_ATTACKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
         att |= (b >> 15) & !FILE_A;
         att |= (b >> 10) & !(FILE_G | FILE_H);
         att |= (b >> 6) & !(FILE_A | FILE_B);
-        att
-    })
-});
+        masks[sq] = att;
+        sq += 1;
+    }
+    masks
+}
 
-pub static KING_ATTACKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
-    std::array::from_fn(|sq| {
+static KNIGHT_ATTACKS: [BB; 64] = gen_knight_attacks();
+
+const fn gen_king_attacks() -> [BB; 64] {
+    let mut masks = [0; 64];
+    let mut sq = 0;
+    while sq < 64 {
         let b = 1u64 << sq;
         let mut att = 0u64;
 
@@ -1593,50 +1627,63 @@ pub static KING_ATTACKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
         att |= (b & !FILE_A) >> 1;
         att |= (b & !FILE_A) << 7;
 
-        att
-    })
-});
+        masks[sq] = att;
+        sq += 1;
+    }
+    masks
+}
 
-static RANK_MASKS: LazyLock<[BB; 64]> =
-    LazyLock::new(|| std::array::from_fn(|sq| 0xFFu64 << (sq & 56)));
+static KING_ATTACKS: [BB; 64] = gen_king_attacks();
 
-static FILE_MASKS: LazyLock<[BB; 64]> =
-    LazyLock::new(|| std::array::from_fn(|sq| FILE_A << (sq % 8)));
+const fn gen_rank_masks() -> [BB; 64] {
+    let mut masks = [0; 64];
+    let mut sq = 0;
+    while sq < 64 {
+        masks[sq] = 0xFFu64 << (sq & 56);
+        sq += 1;
+    }
+    masks
+}
 
-#[allow(unused)]
-static RANK_AND_FILE_MASKS: LazyLock<[BB; 64]> =
-    LazyLock::new(|| std::array::from_fn(|i| RANK_MASKS[i] | FILE_MASKS[i]));
+static RANK_MASKS: [BB; 64] = gen_rank_masks();
 
-// TODO: rook mask (don't include ends)
-// TODO: bishop mask (don't include ends)
+const fn gen_file_masks() -> [BB; 64] {
+    let mut masks = [0; 64];
+    let mut sq = 0;
+    while sq < 64 {
+        masks[sq] = FILE_A << (sq % 8);
+        sq += 1;
+    }
+    masks
+}
+
+static FILE_MASKS: [BB; 64] = gen_file_masks();
+
+const fn gen_diagonal_masks(dir: i32) -> [BB; 64] {
+    let mut masks = [0; 64];
+    let mut sq = 0;
+    while sq < 64 {
+        let d = (sq / 8) as i32 + ((sq % 8) as i32 * dir);
+        let mut mask = 0u64;
+        let mut s = 0;
+        while s < 64 {
+            if (s / 8) as i32 + (s % 8) as i32 * dir == d {
+                mask |= 1u64 << s;
+            }
+            s += 1;
+        }
+        masks[sq] = mask;
+        sq += 1;
+    }
+
+    masks
+}
 
 // top right -> bottom left
-static DIAGONAL_MASKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
-    std::array::from_fn(|sq| {
-        let d = (sq / 8) as i32 - (sq % 8) as i32;
-        let mut mask = 0u64;
-        for s in 0..64usize {
-            if (s / 8) as i32 - (s % 8) as i32 == d {
-                mask |= 1u64 << s;
-            }
-        }
-        mask
-    })
-});
+static DIAGONAL_MASKS: [BB; 64] = gen_diagonal_masks(-1);
 
 // top left -> bottom right
-static ANTI_DIAGONAL_MASKS: LazyLock<[BB; 64]> = LazyLock::new(|| {
-    std::array::from_fn(|sq| {
-        let d = (sq / 8) as i32 + (sq % 8) as i32;
-        let mut mask = 0u64;
-        for s in 0..64usize {
-            if (s / 8) as i32 + (s % 8) as i32 == d {
-                mask |= 1u64 << s;
-            }
-        }
-        mask
-    })
-});
+static ANTI_DIAGONAL_MASKS: [BB; 64] = gen_diagonal_masks(1);
 
 const FILE_A: u64 = 0x0101010101010101;
 const FILE_B: u64 = FILE_A << 1;

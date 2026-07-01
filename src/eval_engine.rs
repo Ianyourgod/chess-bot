@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use crate::game::{Color, Game, Move, PieceTy, Pos, Square};
 
@@ -22,10 +25,13 @@ const PIECE_POS_MULT: i32 = 2;
 const MOBILITY_MULT: i32 = 2;
 const BISHOP_PAIRS: i32 = 8;
 const DOUBLED_PAWNS: i32 = -4;
-const TO_MOVE_BONUS: i32 = 4;
+const PASSED_PAWNS: i32 = 8;
+const TO_MOVE_BONUS: i32 = 2;
 
 const MAX_EXTENSIONS: u16 = 16;
 const NULL_MOVE_REDUX: u16 = 3;
+
+pub static NODES_SEARCHED: Mutex<u64> = Mutex::new(0);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CalcConstraint {
@@ -71,13 +77,11 @@ impl Engine {
 
         loop {
             // TODO: figure out a way to only log when we're not doing ratatui stuff
-            /*
             println!(
                 "depth {} at {}ms",
                 depth,
                 self.start_time.elapsed().as_millis()
             );
-            */
 
             // -50 so that our move thing (prioritize late/early checkmates) still works with this
             if best.0 >= (CHECKMATE - 50) || self.timed_out(depth) {
@@ -153,6 +157,8 @@ impl Engine {
         moves: usize,
         extensions_left: u16,
     ) -> i32 {
+        // TODO: killer moves
+
         if self.timed_out(depth) {
             return 0;
         }
@@ -291,6 +297,8 @@ impl Engine {
     }
 
     fn eval_base(&mut self, game: &Game, moves: usize) -> i32 {
+        //*NODES_SEARCHED.lock().unwrap() += 1;
+
         if !game.has_been_played(game)
             && let Some((score, _, CacheBound::Exact)) = self.cache.cache_get(game.get_hash())
         {
@@ -327,11 +335,18 @@ impl Engine {
 
         let doubled_pawns = game.doubled_pawns_check(c) * DOUBLED_PAWNS;
 
-        // TODO: passed pawns
+        // TODO: this makes the engine a lot slower. seemingly its because of something related to cpu cache?
+        let passed_pawns = game.passed_pawns_check(c) * PASSED_PAWNS;
 
-        basic_piece_score + piece_pos_values + mobility + bishop_pairs + doubled_pawns
+        basic_piece_score
+            + piece_pos_values
+            + mobility
+            + bishop_pairs
+            + doubled_pawns
+            + passed_pawns
     }
 
+    /*
     #[allow(unused)]
     fn mobility(&self, game: &Game, color: Color) -> i32 {
         // TODO: use get_all_pseudo moves somehow
@@ -348,6 +363,7 @@ impl Engine {
             })
             .sum()
     }
+    */
 
     /// only use when you know the move is a capture. this is to account for en pass. if you know its not, just directly get the .to
     #[inline]

@@ -8,22 +8,6 @@ use crate::game::{BB, FILE_A, FILE_H, RANK_1, RANK_8, bit, pop_lsb};
 
 type RookupTable = HashMap<(u32, BB), BB>;
 
-fn create_rook_lookup_table() -> RookupTable {
-    let mut table = HashMap::new();
-
-    for n in 0..64 {
-        let rank_part = super::RANK_MASKS[n] & !(FILE_A | FILE_H);
-        let file_part = super::FILE_MASKS[n] & !(RANK_1 | RANK_8);
-        let rook_mask = rank_part | file_part;
-
-        get_all_blocker_patterns(rook_mask).for_each(|pat| {
-            table.insert((n as u32, pat), create_rook_legal_move(n as u32, pat));
-        })
-    }
-
-    table
-}
-
 fn get_all_blocker_patterns(mut mask: BB) -> impl Iterator<Item = BB> {
     let positions = std::iter::repeat_with(|| pop_lsb(&mut mask))
         .take_while(|&n| n < 64)
@@ -37,13 +21,13 @@ fn get_all_blocker_patterns(mut mask: BB) -> impl Iterator<Item = BB> {
     })
 }
 
-fn create_rook_legal_move(sq: u32, blockers: BB) -> BB {
+const fn create_rook_legal_move(sq: u32, blockers: BB) -> BB {
     hyperbola_quintessence(sq, blockers, super::RANK_MASKS[sq as usize])
         | hyperbola_quintessence(sq, blockers, super::FILE_MASKS[sq as usize])
 }
 
 #[inline]
-fn hyperbola_quintessence(sq: u32, all: BB, mask: BB) -> BB {
+const fn hyperbola_quintessence(sq: u32, all: BB, mask: BB) -> BB {
     let o = all & mask;
     let s = bit(sq);
 
@@ -59,13 +43,25 @@ fn hyperbola_quintessence(sq: u32, all: BB, mask: BB) -> BB {
 const START_SHIFT_ROOK: u32 = 52;
 const START_SHIFT_BISHOP: u32 = 54;
 
+const MAX_TABLE_SIZE: usize = 2_usize.pow(64 - START_SHIFT_ROOK);
+
 #[derive(Debug, Clone)]
 pub struct MagicLookup {
     pub magic: u64,
     pub shift: u32,
     sq: usize,
-    lookup: Box<[BB]>,
+    lookup: [BB; MAX_TABLE_SIZE],
     is_rook: bool,
+}
+
+impl MagicLookup {
+    pub const EMPTY: Self = Self {
+        magic: 0,
+        shift: 0,
+        sq: 0,
+        lookup: [0; MAX_TABLE_SIZE],
+        is_rook: false,
+    };
 }
 
 impl MagicLookup {
@@ -95,94 +91,116 @@ impl MagicLookup {
     }
 }
 
-fn generate_rook_magics(rng: &mut SmallRng) -> [MagicLookup; 64] {
-    let rookup_table = create_rook_lookup_table();
-    std::array::from_fn(|n| {
-        let rank_part = super::RANK_MASKS[n as usize] & !(FILE_A | FILE_H);
-        let file_part = super::FILE_MASKS[n as usize] & !(RANK_1 | RANK_8);
+const fn generate_rook_table_from_magic(magics: [(u64, u32); 64]) -> [MagicLookup; 64] {
+    let mut result = [MagicLookup::EMPTY; 64];
+
+    let mut n = 0usize;
+    while n < 64 {
+        let (magic, shift) = magics[n];
+        let rank_part = super::RANK_MASKS[n] & !(FILE_A | FILE_H);
+        let file_part = super::FILE_MASKS[n] & !(RANK_1 | RANK_8);
         let rook_mask = rank_part | file_part;
-        let (magic, shift) =
-            generate_magic_number(n as u32, START_SHIFT_ROOK, &rookup_table, rng, rook_mask);
 
-        let mut lookup = vec![0; 1 << (64 - shift)];
+        let mut positions = [0u32; (64 - START_SHIFT_ROOK as usize)];
+        let mut pos_count = 0usize;
+        let mut m = rook_mask;
+        loop {
+            let b = pop_lsb(&mut m);
+            if b >= 64 {
+                break;
+            }
+            positions[pos_count] = b;
+            pos_count += 1;
+        }
 
-        get_all_blocker_patterns(rook_mask)
-            .map(|pat| pat)
-            .for_each(|pat| {
-                let idx = (pat.wrapping_mul(magic) >> shift) as usize;
-                let legal = *rookup_table.get(&(n as u32, pat)).unwrap();
+        let pattern_count = 1usize << pos_count;
+        let mut lookup = [0u64; MAX_TABLE_SIZE];
 
-                lookup[idx] = legal;
-            });
+        let mut p = 0usize;
+        while p < pattern_count {
+            let mut num = 0u64;
+            let mut nb = p as u64;
+            loop {
+                let b = pop_lsb(&mut nb);
+                if b >= 64 {
+                    break;
+                }
+                num |= bit(positions[b as usize]);
+            }
 
-        MagicLookup {
+            let idx = (num.wrapping_mul(magic) >> shift) as usize;
+            let legal = create_rook_legal_move(n as u32, num);
+            lookup[idx] = legal;
+
+            p += 1;
+        }
+
+        result[n] = MagicLookup {
             magic,
             shift,
             sq: n,
-            lookup: lookup.into_boxed_slice(),
+            lookup,
             is_rook: true,
-        }
-    })
+        };
+        n += 1;
+    }
+
+    result
 }
 
-fn generate_rook_table_from_magic(magics: [(u64, u32); 64]) -> [MagicLookup; 64] {
-    let rookup_table = create_rook_lookup_table();
+const fn generate_bishop_table_from_magic(magics: [(u64, u32); 64]) -> [MagicLookup; 64] {
+    let mut result = [MagicLookup::EMPTY; 64];
 
-    std::array::from_fn(|n| {
+    let mut n = 0usize;
+    while n < 64 {
         let (magic, shift) = magics[n];
-
-        let mut lookup = vec![0; 1 << (64 - shift)];
-
-        let rank_part = super::RANK_MASKS[n as usize] & !(FILE_A | FILE_H);
-        let file_part = super::FILE_MASKS[n as usize] & !(RANK_1 | RANK_8);
-        let rook_mask = rank_part | file_part;
-
-        get_all_blocker_patterns(rook_mask)
-            .map(|pat| pat)
-            .for_each(|pat| {
-                let idx = (pat.wrapping_mul(magic) >> shift) as usize;
-                let legal = *rookup_table.get(&(n as u32, pat)).unwrap();
-
-                lookup[idx] = legal;
-            });
-
-        MagicLookup {
-            magic,
-            shift,
-            sq: n,
-            lookup: lookup.into_boxed_slice(),
-            is_rook: true,
-        }
-    })
-}
-
-fn generate_bishop_table_from_magic(magics: [(u64, u32); 64]) -> [MagicLookup; 64] {
-    let rookup_table = create_bishop_lookup_table();
-
-    std::array::from_fn(|n| {
-        let (magic, shift) = magics[n];
-
-        let mut lookup = vec![0; 1 << (64 - shift)];
-
         let bishop_mask = BISHOP_MASKS_NO_ENDS[n];
 
-        get_all_blocker_patterns(bishop_mask)
-            .map(|pat| pat)
-            .for_each(|pat| {
-                let idx = (pat.wrapping_mul(magic) >> shift) as usize;
-                let legal = *rookup_table.get(&(n as u32, pat)).unwrap();
+        let mut positions = [0u32; (64 - START_SHIFT_ROOK as usize)];
+        let mut pos_count = 0usize;
+        let mut m = bishop_mask;
+        loop {
+            let b = pop_lsb(&mut m);
+            if b >= 64 {
+                break;
+            }
+            positions[pos_count] = b;
+            pos_count += 1;
+        }
 
-                lookup[idx] = legal;
-            });
+        let pattern_count = 1usize << pos_count;
+        let mut lookup = [0u64; MAX_TABLE_SIZE];
 
-        MagicLookup {
+        let mut p = 0usize;
+        while p < pattern_count {
+            let mut num = 0u64;
+            let mut nb = p as u64;
+            loop {
+                let b = pop_lsb(&mut nb);
+                if b >= 64 {
+                    break;
+                }
+                num |= bit(positions[b as usize]);
+            }
+
+            let idx = (num.wrapping_mul(magic) >> shift) as usize;
+            let legal = create_bishop_legal_move(n as u32, num);
+            lookup[idx] = legal;
+
+            p += 1;
+        }
+
+        result[n] = MagicLookup {
             magic,
             shift,
             sq: n,
-            lookup: lookup.into_boxed_slice(),
+            lookup,
             is_rook: false,
-        }
-    })
+        };
+        n += 1;
+    }
+
+    result
 }
 
 fn generate_magic_number(
@@ -252,7 +270,7 @@ fn check_if_works(
         .last()
 }
 
-fn step(s: u32, d: (i32, i32)) -> Option<u32> {
+const fn step(s: u32, d: (i32, i32)) -> Option<u32> {
     let rank = s / 8;
     let file = s % 8;
 
@@ -288,10 +306,15 @@ fn step(s: u32, d: (i32, i32)) -> Option<u32> {
         _ => unreachable!(),
     }
 }
-fn bishop_mask(square: u32) -> u64 {
+const fn bishop_mask(square: u32) -> u64 {
     let mut mask = 0;
 
-    for dir in [(1, 1), (-1, 1), (1, -1), (-1, -1)] {
+    let dirs = [(1, 1), (-1, 1), (1, -1), (-1, -1)];
+    let mut i = 0;
+
+    while i < dirs.len() {
+        let dir = dirs[i];
+        i += 1;
         let Some(mut s) = step(square, dir) else {
             continue;
         };
@@ -305,8 +328,19 @@ fn bishop_mask(square: u32) -> u64 {
     mask
 }
 
-static BISHOP_MASKS_NO_ENDS: LazyLock<[BB; 64]> =
-    LazyLock::new(|| std::array::from_fn(|sq| bishop_mask(sq as u32)));
+const fn create_bishop_masks() -> [BB; 64] {
+    let mut masks = [0; 64];
+    let mut sq = 0;
+
+    while sq < 64 {
+        masks[sq] = bishop_mask(sq as u32);
+        sq += 1;
+    }
+
+    masks
+}
+
+static BISHOP_MASKS_NO_ENDS: [BB; 64] = create_bishop_masks();
 
 fn create_bishop_lookup_table() -> RookupTable {
     let mut table = HashMap::new();
@@ -322,42 +356,9 @@ fn create_bishop_lookup_table() -> RookupTable {
     table
 }
 
-fn create_bishop_legal_move(sq: u32, all: BB) -> BB {
+const fn create_bishop_legal_move(sq: u32, all: BB) -> BB {
     hyperbola_quintessence(sq, all, super::DIAGONAL_MASKS[sq as usize])
         | hyperbola_quintessence(sq, all, super::ANTI_DIAGONAL_MASKS[sq as usize])
-}
-
-fn generate_bishop_magics(rng: &mut SmallRng) -> [MagicLookup; 64] {
-    let rookup_table = create_bishop_lookup_table();
-    std::array::from_fn(|n| {
-        let bishop_mask = BISHOP_MASKS_NO_ENDS[n];
-        let (magic, shift) = generate_magic_number(
-            n as u32,
-            START_SHIFT_BISHOP,
-            &rookup_table,
-            rng,
-            bishop_mask,
-        );
-
-        let mut lookup = vec![0; 1 << (64 - shift)];
-
-        get_all_blocker_patterns(bishop_mask)
-            .map(|pat| pat)
-            .for_each(|pat| {
-                let idx = (pat.wrapping_mul(magic) >> shift) as usize;
-                let legal = *rookup_table.get(&(n as u32, pat)).unwrap();
-
-                lookup[idx] = legal;
-            });
-
-        MagicLookup {
-            magic,
-            shift,
-            sq: n,
-            lookup: lookup.into_boxed_slice(),
-            is_rook: false,
-        }
-    })
 }
 
 /*
@@ -374,9 +375,13 @@ pub static ROOK_MAGICS: LazyLock<[MagicLookup; 64]> = LazyLock::new(|| {
 });
 */
 
+// TODO: write to file so we stop recalculating and raising my cpu temps
+
+//#[allow(long_running_const_eval)]
 pub static BISHOP_MAGICS: LazyLock<[MagicLookup; 64]> =
     LazyLock::new(|| generate_bishop_table_from_magic(BISHOP_MAGICS_PRECOMP));
 
+//#[allow(long_running_const_eval)]
 pub static ROOK_MAGICS: LazyLock<[MagicLookup; 64]> =
     LazyLock::new(|| generate_rook_table_from_magic(ROOK_MAGICS_PRECOMP));
 
